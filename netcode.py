@@ -11,6 +11,23 @@ from yarl import URL
 
 T = TypeVar("T", bound=BaseModel)
 
+PLEX_CONTENT_TYPES: dict[str, int] = {
+    "movie": 1,
+    "show": 2,
+    "season": 3,
+    "episode": 4,
+    "trailer": 5,
+    "person": 7,
+    "artist": 8,
+    "album": 9,
+    "track": 10,
+    "clip": 12,
+    "photo": 13,
+    "photoalbum": 14,
+    "playlist": 15,
+    "playlistfolder": 16,
+}
+
 
 # Pydantic models for API responses
 class SearchStartResponse(BaseModel):
@@ -212,3 +229,79 @@ class QBittorrentClient:
             else:
                 logging.error(f"Failed to initiate torrent download: {response.status}")
                 raise Exception("Download failed")
+
+
+class PlexAPIClient:
+    def __init__(self):
+        load_dotenv()
+        self.base_url = os.getenv("PMS_URL")
+        self.token = os.getenv("PLEX_TOKEN")
+        self.client_id = os.getenv("PLEX_CLIENT_ID")
+        self.client_name = os.getenv("PLEX_CLIENT_NAME")
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        assert self.session is not None
+        await self.session.close()
+
+    async def get_library_matches(
+        self,
+        title: str,
+        metadata_type: str,
+        year: int | None = None,
+        parentTitle: str | None = None,
+    ) -> dict:
+        assert self.session is not None
+        url = f"{self.base_url}/library/matches"
+        assert self.token, "Token not found"
+        metadata_type_id = PLEX_CONTENT_TYPES[metadata_type]
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        # TODO: This return model is a bear we'll do this properly later.
+        payload = {
+            "title": title,
+            "type": metadata_type_id,
+            "includeFullMetadata": 1,
+        }
+        # This crashes if you send Nones
+        if year:
+            payload["year"] = year
+        if parentTitle:
+            payload["parentTitle"] = parentTitle
+        logging.debug(f"Fetching library matches for: {payload}")
+        async with self.session.get(url, headers=headers, params=payload) as response:
+            if response.status == 200:
+                logging.debug(f"Got library matches: {await response.text()}")
+                return await response.json()
+            else:
+                raise Exception(
+                    f"Failed to get library matches: {response.status}, {await response.text()}"
+                )
+
+    async def get_all_library_items(self, query_params: dict | None = None) -> dict:
+        assert self.session is not None
+        url = f"{self.base_url}/library/all"
+        assert self.token, "Token not found"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        async with self.session.get(
+            url, headers=headers, params=query_params
+        ) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                raise Exception(
+                    f"Failed to get library items: {response.status}, {await response.text()}"
+                )

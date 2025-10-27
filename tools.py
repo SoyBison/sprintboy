@@ -1,6 +1,8 @@
+import logging
 from langchain.tools import BaseTool, ToolRuntime, tool
-from netcode import QBittorrentClient, SearchResult
+from netcode import QBittorrentClient, SearchResult, PlexAPIClient, PLEX_CONTENT_TYPES
 from dataclasses import dataclass
+from pydantic import BaseModel
 
 
 @dataclass
@@ -12,7 +14,7 @@ class KnownTorrents:
 
 @tool
 async def search_for_torrents(query: str, runtime: ToolRuntime[KnownTorrents]) -> str:
-    """Perform a search query on qBittorrent and return the results."""
+    """Perform a search query on qBittorrent and return the results. This is not like google. It only returns results that match the query in a fuzzy REGEX. Do not include words like "discography" in your search, this only returns single album torrents, or single movies, or single episodes."""
     async with QBittorrentClient() as qclient:
         results = await qclient.search(query)
         if not results.results:
@@ -36,3 +38,43 @@ async def add_torrent(name: str, runtime: ToolRuntime[KnownTorrents]) -> str:
     async with QBittorrentClient() as qclient:
         await qclient.add_torrent(url)
         return "Torrent added successfully."
+
+
+class PlexAlbumQuery(BaseModel):
+    title: str | None
+    artist: str
+
+
+@tool(args_schema=PlexAlbumQuery)
+async def check_for_album(artist: str, title: str | None = None) -> str:
+    """
+    This tool is used to check if the user already has an album by a given artist. You can also not specify a title and it will return all albums by the artist. Remember that this is an exact match based service, and so you may want to also search aliases and alternative spellings to be sure, if that makes sense.
+    """
+    album_type = PLEX_CONTENT_TYPES["album"]
+    logging.debug(f"Checking for album: {artist} {title}")
+    async with PlexAPIClient() as plex:
+        if title:
+            results = await plex.get_all_library_items(
+                {"type": album_type, "artist.title": artist, "title": title}
+            )
+        else:
+            results = await plex.get_all_library_items(
+                {"type": album_type, "artist.title": artist}
+            )
+    if "MediaContainer" not in results:
+        return "The User does not have any albums that match the query."
+    if "Metadata" not in results["MediaContainer"]:
+        return "The User does not have any albums that match the query."
+    if len(results["MediaContainer"]["Metadata"]) == 0:
+        return (
+            f"The User does not have any albums that match the query: {artist} {title}"
+        )
+    logging.debug(f"Got results: {results}")
+    response_text = "The User already has the following albums:\n" + "\n".join(
+        [
+            f"{result['title']} by {result['parentTitle']}"
+            for result in results["MediaContainer"]["Metadata"]
+        ]
+    )
+
+    return response_text
