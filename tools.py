@@ -78,3 +78,33 @@ async def check_for_album(artist: str, title: str | None = None) -> str:
     )
 
     return response_text
+
+
+class PlexSongQuery(BaseModel):
+    title: str
+    album: str | None
+    artist: str | None
+
+
+@tool(args_schema=PlexSongQuery)
+async def get_song_id(artist: str, title: str | None = None) -> str:
+    song_type = PLEX_CONTENT_TYPES["song"]
+    async with PlexAPIClient() as plex:
+        results = await plex.get_all_library_items(
+            {
+                "type": song_type,
+                "artist.title": artist,
+                "title": title,
+                "album.title": album,
+            }
+        )
+    if "MediaContainer" not in results:
+        return "The User does not have any albums that match the query."
+    if "Metadata" not in results["MediaContainer"]:
+        return "The User does not have any albums that match the query."
+    if len(results["MediaContainer"]["Metadata"]) == 0:
+        return (
+            f"The User does not have any albums that match the query: {artist} {title}"
+        )
+    song_id = results["MediaContainer"]["Metadata"][0]["key"]
+    return song_id

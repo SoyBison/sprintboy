@@ -1,4 +1,5 @@
 import pytest
+import json
 
 import logging
 from netcode import (
@@ -151,16 +152,61 @@ class TestPlexAPIClient:
             results = await client.get_all_library_items(
                 {
                     "type": 9,
-                    "parentTitle": "Fleet Foxes",
+                    "artist.title": "Fleet Foxes",
                     "title": "Shore",
                     "year": 2020,
                 }
             )
 
             assert isinstance(results, dict)
-            print("✓ Library search returned valid response")
+            song_id = results["MediaContainer"]["Metadata"][0]["key"]
+            assert song_id
+            print("✓ Library search returned valid response, shore id: ", song_id)
 
             # Check if MediaContainer exists (standard Plex response structure)
             assert "MediaContainer" in results
             logging.debug(results)
             assert len(results["MediaContainer"]["Metadata"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_get_specific_song(self):
+        async with PlexAPIClient() as client:
+            results = await client.get_all_library_items(
+                {
+                    "type": 10,
+                    "artist.title": "MF DOOM",
+                    "album.title": "MM..FOOD",
+                    "title": "Rapp Snitch Knishes",
+                }
+            )
+
+            assert isinstance(results, dict)
+            print(results)
+            song_id = results["MediaContainer"]["Metadata"][0]["key"]
+            assert song_id
+            print(
+                "✓ Library search returned valid response, rapp snitch knishes id: ",
+                song_id,
+            )
+
+            # Check if MediaContainer exists (standard Plex response structure)
+            assert "MediaContainer" in results
+            logging.debug(results)
+            assert len(results["MediaContainer"]["Metadata"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_make_playlist(self):
+        async with PlexAPIClient() as client:
+            # first get rapp snitch knishes by mf doom
+            results = await client.get_all_library_items(
+                {
+                    "type": 10,
+                    "parentTitle": "MF Doom",
+                    "title": "Rapp Snitch Knishes",
+                }
+            )
+            logging.debug(json.dumps(results, indent=2))
+            song_id = results["MediaContainer"]["Metadata"][0]["key"]
+            logging.debug(song_id)
+            await client.create_playlist("Rapp Snitch Knishes", song_id)
+            print("✓ Playlist created successfully")

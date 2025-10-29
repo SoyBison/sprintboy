@@ -238,6 +238,8 @@ class PlexAPIClient:
         self.token = os.getenv("PLEX_TOKEN")
         self.client_id = os.getenv("PLEX_CLIENT_ID")
         self.client_name = os.getenv("PLEX_CLIENT_NAME")
+        self.plex_machine_id = os.getenv("PLEX_MACHINE_ID")
+        self.music_library_id = os.getenv("PMS_MUSIC_LIBRARY_ID")
         self.session = None
 
     async def __aenter__(self):
@@ -304,4 +306,29 @@ class PlexAPIClient:
             else:
                 raise Exception(
                     f"Failed to get library items: {response.status}, {await response.text()}"
+                )
+
+    async def create_playlist(self, title: str, first_item_id: str) -> dict:
+        assert self.session is not None
+        url = f"{self.base_url}/playlists"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        # Yes, this is how it works
+        params = {
+            "uri": f"server://{self.plex_machine_id}/com.plexapp.plugins.library{first_item_id}",
+            "title": title,
+            "type": "audio",
+            "smart": 0,
+        }
+        logging.debug(f"Creating playlist: {params}")
+        async with self.session.post(url, headers=headers, params=params) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                raise Exception(
+                    f"Failed to create playlist: {response.status}, {await response.text()}"
                 )
