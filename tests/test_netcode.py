@@ -2,7 +2,7 @@ import pytest
 import json
 
 import logging
-from netcode import (
+from bot.netcode import (
     QBittorrentClient,
     PlexAPIClient,
     SearchResultsResponse,

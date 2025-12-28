@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  sprintboy:
+    build: .
+    container_name: sprintboy-dev
+    restart: unless-stopped
+    volumes:
+      - ./src:/app/src  # Hot reload source
+      - ./.env:/app/.env
+    environment:
+      - ENVIRONMENT=development
+    env_file:
+      - .env

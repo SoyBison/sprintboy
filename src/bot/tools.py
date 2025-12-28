@@ -1,8 +1,14 @@
 import logging
 from langchain.tools import BaseTool, ToolRuntime, tool
-from netcode import QBittorrentClient, SearchResult, PlexAPIClient, PLEX_CONTENT_TYPES
+from bot.netcode import (
+    QBittorrentClient,
+    SearchResult,
+    PlexAPIClient,
+    PLEX_CONTENT_TYPES,
+)
 from dataclasses import dataclass
 from pydantic import BaseModel
+from thefuzz import process
 
 
 @dataclass
@@ -12,28 +18,43 @@ class KnownTorrents:
     torrents: dict[str, SearchResult]
 
 
-@tool
-async def search_for_torrents(query: str, runtime: ToolRuntime[KnownTorrents]) -> str:
-    """Perform a search query on qBittorrent and return the results. This is not like google. It only returns results that match the query in a fuzzy REGEX. Do not include words like "discography" in your search, this only returns single album torrents, or single movies, or single episodes."""
+class TorrentAddQuery(BaseModel):
+    name: str
+
+
+class AlbumSearchQuery(BaseModel):
+    query: str
+
+
+@tool(args_schema=AlbumSearchQuery)
+async def search_for_albums(query: str, runtime: ToolRuntime[KnownTorrents]) -> str:
+    """Perform a search query on qBittorrent and return the results. This is not like google. It only returns results that match the query in a fuzzy REGEX. Do not include words like "discography" or "album" in your search, this tool only returns single album torrents, or single movies, or single episodes. It is best to only include album titles and artist names in your query."""
     async with QBittorrentClient() as qclient:
         results = await qclient.search(query)
         if not results.results:
             return "No results found."
+        # filter out results that are not flacs
+        results = [result for result in results.results if ("FLAC" in result.fileName)]
+
         # Store results in runtime for later use
-        for result in results.results:
+        for result in results:
             runtime.context.torrents[result.fileName] = result
-        summary = "\n".join(result.fileName for result in results.results)
+        summary = "\n".join(result.fileName for result in results)
     return f"Search results:\n{summary}"
 
 
-@tool
+@tool(args_schema=TorrentAddQuery)
 async def add_torrent(name: str, runtime: ToolRuntime[KnownTorrents]) -> str:
-    """Add a torrent to qBittorrent using a name retrieved from a previous search."""
-    if name not in runtime.context.torrents:
+    """Add a torrent to qBittorrent using a name retrieved from a previous search. Fuzzy search."""
+    top_result = process.extractOne(name, runtime.context.torrents.keys())
+    corrected_name = top_result[0]
+    score = top_result[1]
+    if score < 80:
         raise FileNotFoundError(
             f"Torrent with name '{name}' not found in known torrents."
         )
-    url = runtime.context.torrents[name].fileUrl
+
+    url = runtime.context.torrents[corrected_name].fileUrl
 
     async with QBittorrentClient() as qclient:
         await qclient.add_torrent(url)
@@ -87,7 +108,12 @@ class PlexSongQuery(BaseModel):
 
 
 @tool(args_schema=PlexSongQuery)
-async def get_song_id(artist: str, title: str | None = None) -> str:
+async def get_song_id(
+    artist: str, title: str | None = None, album: str | None = None
+) -> str:
+    """
+    This tool is used to get the song id for a given song, providing the artist and title.
+    """
     song_type = PLEX_CONTENT_TYPES["song"]
     async with PlexAPIClient() as plex:
         results = await plex.get_all_library_items(

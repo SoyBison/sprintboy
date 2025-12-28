@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  sprintboy:
+    image: sprintboy:latest
+    container_name: sprintboy
+    restart: unless-stopped
+    volumes:
+      - /mnt/user/appdata/sprintboy/data:/app/data
+      - /mnt/user:/mnt/user:ro  # Read-only NAS access
+    environment:
+      - ENVIRONMENT=production
+    env_file:
+      - .env.production
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
