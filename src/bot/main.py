@@ -32,8 +32,10 @@ async def on_ready():
 
     # Sync slash commands with Discord
     try:
-        await bot.tree.sync()
-        await bot.tree.sync(guild=server_guild)
+        synced_commands = await bot.tree.sync()
+        logger.info(f"{len(synced_commands)} Slash commands synced globally")
+        synced_commands = await bot.tree.sync(guild=server_guild)
+        logger.info(f"{len(synced_commands)} Slash commands synced in server guild")
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
