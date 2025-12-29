@@ -49,15 +49,15 @@ async def ping(interaction: discord.Interaction):
 @discord.app_commands.describe(query="The query to send to chatgpt")
 async def music_query(interaction: discord.Interaction, query: str):
     load_dotenv()
-    llm = ChatOllama(
-        model="gpt-oss:120b",
-        base_url=Config.OLLAMA_API_URL,
-        temperature=0,
-        num_ctx=32000,
-    )
-    # llm = ChatAnthropic(
-    # model_name="claude-sonnet-4-5-20250929",
+    # llm = ChatOllama(
+    # model="gpt-oss:120b",
+    # base_url=Config.OLLAMA_API_URL,
+    # temperature=0,
+    # num_ctx=32000,
     # )
+    llm = ChatAnthropic(
+        model_name="claude-sonnet-4-5-20250929",
+    )
 
     agent = create_agent(
         llm,
