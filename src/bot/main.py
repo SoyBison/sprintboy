@@ -16,7 +16,6 @@ from bot.config import Config
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="sprintboy.log",
 )
 logger = logging.getLogger(__name__)
 
@@ -33,6 +32,7 @@ async def on_ready():
 
     # Sync slash commands with Discord
     try:
+        await bot.tree.sync()
         await bot.tree.sync(guild=server_guild)
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
@@ -40,6 +40,7 @@ async def on_ready():
 
 @bot.tree.command(name="ping", description="Check if the bot is responsive")
 async def ping(interaction: discord.Interaction):
+    logger.info("Received ping command")
     await interaction.response.send_message(
         f"Pong! Running in {Config.ENVIRONMENT} mode"
     )
@@ -49,6 +50,7 @@ async def ping(interaction: discord.Interaction):
 @discord.app_commands.describe(query="The query to send to chatgpt")
 async def music_query(interaction: discord.Interaction, query: str):
     load_dotenv()
+    logger.info(f"Received music query: {query}")
     # llm = ChatOllama(
     # model="gpt-oss:120b",
     # base_url=Config.OLLAMA_API_URL,
