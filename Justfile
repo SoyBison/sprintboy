@@ -1,4 +1,5 @@
 set dotenv-load
+set export
 
 default:
     @just --list
@@ -25,9 +26,6 @@ build:
     docker build -t sprintboy:latest .
 
 deploy: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    
     echo "Building production image..."
     docker save sprintboy:latest | gzip > /tmp/sprintboy.tar.gz
     
@@ -36,23 +34,14 @@ deploy: build
     scp docker-compose.prod.yml root@shiitake:/mnt/user/appdata/sprintboy/docker-compose.yml
     scp .env.production root@shiitake:/mnt/user/appdata/sprintboy/.env.production
     
-    echo "Deploying on Unraid..."
-    ssh root@shiitake << 'EOF'
-        cd /mnt/user/appdata/sprintboy
-        docker load < /tmp/sprintboy.tar.gz
-        docker compose down
-        docker compose up -d
-        rm /tmp/sprintboy.tar.gz
-    EOF
+    echo "unpacking tarball on unraid..."
+    ssh root@shiitake "docker load --input /tmp/sprintboy.tar.gz"
     
     rm /tmp/sprintboy.tar.gz
-    echo "Deployment complete!"
+    echo "Deployment complete! Go to Unraid to Update"
 
 # Deploy without rebuilding (faster for quick iterations)
 deploy-quick:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    
     echo "Copying source to Unraid..."
     ssh root@shiitake "mkdir -p /mnt/user/appdata/sprintboy"
     rsync -avz --delete ./src/ root@shiitake:/mnt/user/appdata/sprintboy/src/

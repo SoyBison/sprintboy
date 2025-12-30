@@ -12,8 +12,3 @@ services:
       - ENVIRONMENT=production
     env_file:
       - .env.production
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
