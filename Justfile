@@ -20,7 +20,7 @@ dev-stop:
     docker compose down
 
 test:
-    uv run pytest
+    uv run pytest -s
 
 build:
     docker build -t sprintboy:latest .

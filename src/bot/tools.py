@@ -1,6 +1,8 @@
 import logging
+from typing import Union
 from langchain.tools import BaseTool, ToolRuntime, tool
 from bot.netcode import (
+    BTCategory,
     QBittorrentClient,
     SearchResult,
     PlexAPIClient,
@@ -12,41 +14,64 @@ from thefuzz import process
 
 
 @dataclass
-class KnownTorrents:
-    """A simple class to keep track of known torrents."""
+class TorrentContext:
+    """A simple class to keep track of known torrents on trackers and qBittorrent."""
 
-    torrents: dict[str, SearchResult]
+    search_results: dict[str, SearchResult]
+    internal_torrents: dict[str, Union[str, None]]
+    torrent_types: set[BTCategory]
 
 
 class TorrentAddQuery(BaseModel):
     name: str
+    category: BTCategory
 
 
-class AlbumSearchQuery(BaseModel):
+class TorrentSearchQuery(BaseModel):
     query: str
+    category: BTCategory
 
 
-@tool(args_schema=AlbumSearchQuery)
-async def search_for_albums(query: str, runtime: ToolRuntime[KnownTorrents]) -> str:
-    """Perform a search query on qBittorrent and return the results. This is not like google. It only returns results that match the query in a fuzzy REGEX. Do not include words like "discography" or "album" in your search, this tool only returns single album torrents, or single movies, or single episodes. It is best to only include album titles and artist names in your query."""
+@tool(args_schema=TorrentSearchQuery)
+async def search_for_torrent(
+    query: str, category: BTCategory, runtime: ToolRuntime[TorrentContext]
+) -> str:
+    """
+    Perform a search query on qBittorrent and return the results.
+    This is not like google.
+    It only returns results that match the query in a fuzzy REGEX.
+    Do not include words like "discography" or "album" in your search, this tool only returns single album torrents, or single movies, or single episodes.
+    It is best to only include album titles and artist names in your query.
+    This tool can find Movies, Music, and TV shows.
+    Do not include words like "BluRay" or "720p" or "1080p" in your query.
+    """
+    runtime.context.torrent_types.add(category)
     async with QBittorrentClient() as qclient:
-        results = await qclient.search(query)
+        results = await qclient.search(query, category)
         if not results.results:
             return "No results found."
         # filter out results that are not flacs
-        results = [result for result in results.results if ("FLAC" in result.fileName)]
+        if category == BTCategory.Music:
+            results = [
+                result for result in results.results if ("FLAC" in result.fileName)
+            ]
+        else:
+            results = results.results
 
         # Store results in runtime for later use
         for result in results:
-            runtime.context.torrents[result.fileName] = result
+            runtime.context.search_results[result.fileName] = result
         summary = "\n".join(result.fileName for result in results)
     return f"Search results:\n{summary}"
 
 
 @tool(args_schema=TorrentAddQuery)
-async def add_torrent(name: str, runtime: ToolRuntime[KnownTorrents]) -> str:
+async def add_torrent(
+    name: str, category: BTCategory, runtime: ToolRuntime[TorrentContext]
+) -> str:
     """Add a torrent to qBittorrent using a name retrieved from a previous search. Fuzzy search."""
-    top_result = process.extractOne(name, runtime.context.torrents.keys())
+    runtime.context.torrent_types.add(category)
+    top_result = process.extractOne(name, runtime.context.search_results.keys())
     corrected_name = top_result[0]
     score = top_result[1]
     if score < 80:
@@ -54,10 +79,11 @@ async def add_torrent(name: str, runtime: ToolRuntime[KnownTorrents]) -> str:
             f"Torrent with name '{name}' not found in known torrents."
         )
 
-    url = runtime.context.torrents[corrected_name].fileUrl
+    url = runtime.context.search_results[corrected_name].fileUrl
 
     async with QBittorrentClient() as qclient:
-        await qclient.add_torrent(url)
+        memory_code = await qclient.add_torrent(url, category)
+        runtime.context.internal_torrents[corrected_name] = memory_code
         return "Torrent added successfully."
 
 
@@ -134,3 +160,40 @@ async def get_song_id(
         )
     song_id = results["MediaContainer"]["Metadata"][0]["key"]
     return song_id
+
+
+class PlexMovieQuery(BaseModel):
+    title: str
+    year: int | None
+
+
+@tool(args_schema=PlexMovieQuery)
+async def check_for_movie(title: str, year: int | None = None) -> str:
+    """
+    This tool is used to check if the user already has a movie by a given title. You can also not specify a year and it will return all movies by the title.
+    """
+    movie_type = PLEX_CONTENT_TYPES["movie"]
+    logging.debug(f"Checking for movie: {title} {year}")
+    async with PlexAPIClient() as plex:
+        if year:
+            results = await plex.get_all_library_items(
+                {"type": movie_type, "title": title, "year": year}
+            )
+        else:
+            results = await plex.get_all_library_items(
+                {"type": movie_type, "title": title}
+            )
+    if "MediaContainer" not in results:
+        return "The User does not have any movies that match the query."
+    if "Metadata" not in results["MediaContainer"]:
+        return "The User does not have any movies that match the query."
+    if len(results["MediaContainer"]["Metadata"]) == 0:
+        return f"The User does not have any movies that match the query: {title} {year}"
+    logging.debug(f"Got results: {results}")
+    response_text = "The User already has the following movies:\n" + "\n".join(
+        [
+            f"{result['title']} ({result['year']})"
+            for result in results["MediaContainer"]["Metadata"]
+        ]
+    )
+    return response_text

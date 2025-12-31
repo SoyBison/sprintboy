@@ -1,3 +1,4 @@
+from enum import StrEnum
 import logging
 import os
 from typing import Callable, TypeVar, List
@@ -6,6 +7,9 @@ import aiohttp
 from dotenv import load_dotenv
 import asyncio
 from pydantic import BaseModel, RootModel
+from cyksuid.v2 import KsuidMs
+
+from thefuzz import process
 
 from yarl import URL
 
@@ -50,6 +54,65 @@ class SearchResult(BaseModel):
 
 class SearchResultsResponse(BaseModel):
     results: List[SearchResult]
+
+
+class TorrentInfoResponse(BaseModel):
+    added_on: int
+    amount_left: int
+    auto_tmm: bool
+    availability: float
+    category: str
+    completed: int
+    completion_on: int
+    content_path: str
+    dl_limit: int
+    dlspeed: int
+    downloaded: int
+    downloaded_session: int
+    eta: int
+    f_l_piece_prio: bool
+    force_start: bool
+    hash: str
+    isPrivate: bool | None = None
+    last_activity: int
+    magnet_uri: str
+    max_ratio: float
+    max_seeding_time: int
+    name: str
+    num_complete: int
+    num_incomplete: int
+    num_leechs: int
+    num_seeds: int
+    priority: int
+    progress: float
+    ratio: float
+    ratio_limit: float
+    save_path: str
+    seeding_time: int
+    seeding_time_limit: int
+    seen_complete: int
+    seq_dl: bool
+    size: int
+    state: str  # TODO: This should be an enum
+    super_seeding: bool
+    total_size: int
+    up_limit: int
+    uploaded: int
+    uploaded_session: int
+    url: str | None = None
+    tags: str  # comma separated
+    time_active: int
+    total_size: int
+    tracker: str
+    up_limit: int
+    upspeed: int
+
+
+class TorrentInfoResponses(RootModel):
+    root: List[TorrentInfoResponse]
+
+
+BTCategory = StrEnum("BTCategory", ("Music", "TV", "Movies"))
 
 
 async def fetch_url(
@@ -117,7 +180,7 @@ class QBittorrentClient:
         self.username = os.getenv("QBITTORRENT_USERNAME", "admin")
         self.password = os.getenv("QBITTORRENT_PASSWORD")
         self.session: aiohttp.ClientSession | None = None
-        self.torrent_path = os.getenv("QBITTORRENT_DOWNLOAD_PATH", "/data/Music")
+        self.torrent_path = os.getenv("QBITTORRENT_DOWNLOAD_PATH", "/data/")
         self.dry_run = os.getenv("QBITTORRENT_DRY_RUN", "false").lower() == "true"
         self.cookie: str | None = None
 
@@ -152,9 +215,12 @@ class QBittorrentClient:
             f"Session cookies after login: {self.session.cookie_jar.filter_cookies(URL(self.base_url))}"
         )
 
-    async def search(self, query: str) -> SearchResultsResponse:
+    async def search(
+        self, query: str, category: BTCategory | None = None
+    ) -> SearchResultsResponse:
         """Perform a search query on qBittorrent and return the results."""
         assert self.session is not None, "Session not initialized"
+
         # We have to start a search,  and poll the status until done, then fetch the results
         logging.debug(f"Starting search for query: {query}")
         logging.debug(
@@ -164,8 +230,8 @@ class QBittorrentClient:
         data = {
             "pattern": query,
             "plugins": "enabled",
-            "category": "all",
-        }  # TODO: Make category configurable
+            "category": category if category else "all",
+        }
         search_response = await fetch_url(
             self.session,
             start_search_url,
@@ -205,15 +271,17 @@ class QBittorrentClient:
         )
         return results_response
 
-    async def add_torrent(self, torrent_url: str) -> None:
+    async def add_torrent(self, torrent_url: str, category: BTCategory) -> str | None:
         """Download a torrent from a given URL."""
         assert self.session is not None, "Session not initialized"
         download_url = f"{self.base_url}/torrents/add"
         logging.debug(f"Downloading torrent from URL: {torrent_url}")
+        memory_code = str(KsuidMs())  # Ksuids should be urlsafe
         payload = {
             "urls": torrent_url,
-            "savepath": self.torrent_path,
-            "category": "Music",
+            "savepath": self.torrent_path + "/" + category.capitalize(),
+            "category": category.capitalize(),
+            "tags": f"sprintboy_{memory_code}",
         }
         if self.dry_run:
             logging.info(f"Dry run enabled, not downloading torrent: {torrent_url}")
@@ -227,8 +295,19 @@ class QBittorrentClient:
                     f"Torrent download initiated successfully for {torrent_url}"
                 )
             else:
-                logging.error(f"Failed to initiate torrent download: {response.status}")
+                logging.error(
+                    f"Failed to initiate torrent download: {response.status}: {await response.text()}"
+                )
                 raise Exception("Download failed")
+            return memory_code
+
+    async def get_torrent_info(self, memory_code: str) -> TorrentInfoResponse:
+        assert self.session is not None, "Session not initialized"
+        info_url = f"{self.base_url}/torrents/info"
+        params = {"tag": f"sprintboy_{memory_code}"}
+        return (
+            await fetch_url(self.session, info_url, TorrentInfoResponses, params=params)
+        ).root[0]
 
 
 class PlexAPIClient:
@@ -240,6 +319,8 @@ class PlexAPIClient:
         self.client_name = os.getenv("PLEX_CLIENT_NAME")
         self.plex_machine_id = os.getenv("PLEX_MACHINE_ID")
         self.music_library_id = os.getenv("PMS_MUSIC_LIBRARY_ID")
+        self.movies_library_id = os.getenv("PMS_MOVIES_LIBRARY_ID")
+        self.tv_library_id = os.getenv("PMS_TV_LIBRARY_ID")
         self.session = None
 
     async def __aenter__(self):
@@ -249,6 +330,41 @@ class PlexAPIClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         assert self.session is not None
         await self.session.close()
+
+    async def get_library_codes(self) -> dict[BTCategory, str]:
+        assert self.session is not None
+        library_info = await self.get_libraries()
+        library_codes = {}
+        for library_item in library_info:
+            if library_item["title"] == "Music":
+                library_codes[BTCategory.Music] = library_item["key"]
+            elif library_item["title"] == "Movies":
+                library_codes[BTCategory.Movies] = library_item["key"]
+            elif library_item["title"] == "TV Shows":
+                library_codes[BTCategory.TV] = library_item["key"]
+        return library_codes
+
+    async def scan_media(self, content_path: str, category: BTCategory):
+        assert self.session is not None
+        library_code = (await self.get_library_codes())[category]
+        url = f"{self.base_url}/library/sections/{library_code}/refresh"
+        logging.debug(f"Initiating media scan for {content_path} at {url}")
+        assert self.token, "Token not found"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        payload = {"folder": content_path}
+        async with self.session.post(url, headers=headers, params=payload) as response:
+            if response.status == 200:
+                logging.debug(f"Media scan initiated successfully for {content_path}")
+            else:
+                logging.error(
+                    f"Failed to initiate media scan: {response.status}: {await response.text()}"
+                )
+                raise Exception("Scan failed")
 
     async def get_library_matches(
         self,
@@ -327,8 +443,75 @@ class PlexAPIClient:
         logging.debug(f"Creating playlist: {params}")
         async with self.session.post(url, headers=headers, params=params) as response:
             if response.status == 200:
-                return await response.json()
+                return (await response.json())["MediaContainer"]["Metadata"][0]
             else:
                 raise Exception(
                     f"Failed to create playlist: {response.status}, {await response.text()}"
+                )
+
+    async def get_playlists(self) -> dict:
+        assert self.session is not None
+        url = f"{self.base_url}/playlists"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        async with self.session.get(url, headers=headers) as response:
+            if response.status == 200:
+                return (await response.json())["MediaContainer"]["Metadata"]
+            else:
+                raise Exception(
+                    f"Failed to get playlists: {response.status}, {await response.text()}"
+                )
+
+    async def get_playlist(self, title: str) -> int:
+        logging.debug(f"Getting playlist id for {title}")
+        playlists = await self.get_playlists()
+        playlist_names = [playlist["title"] for playlist in playlists]
+        extraction = process.extractOne(title, playlist_names)
+
+        if not extraction:
+            raise Exception("Playlist not found")
+        closest_playlist_name = extraction[0]
+        closest_playlist_score = extraction[1]
+
+        if closest_playlist_score < 90:
+            raise Exception("Playlist not found")
+        closest_playlist_idx = playlist_names.index(closest_playlist_name)
+        return playlists[closest_playlist_idx]["key"].split("/")[2]
+
+    async def delete_playlist(self, playlist_id: int) -> None:
+        assert self.session is not None
+        url = f"{self.base_url}/playlists/{playlist_id}"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        async with self.session.delete(url, headers=headers) as response:
+            if response.status == 204:
+                return
+            else:
+                raise Exception(
+                    f"Failed to delete playlist: {response.status}, {await response.text()}"
+                )
+
+    async def get_libraries(self) -> dict:
+        assert self.session is not None
+        url = f"{self.base_url}/library/sections"
+        headers = {
+            "Accept": "application/json",
+            "X-Plex-Product": self.client_name,
+            "X-Plex-Client-Identifier": self.client_id,
+            "X-Plex-Token": self.token,
+        }
+        async with self.session.get(url, headers=headers) as response:
+            if response.status == 200:
+                return (await response.json())["MediaContainer"]["Directory"]
+            else:
+                raise Exception(
+                    f"Failed to get libraries: {response.status}, {await response.text()}"
                 )

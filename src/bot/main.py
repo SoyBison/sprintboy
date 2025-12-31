@@ -1,16 +1,25 @@
-import logging
-from argparse import ArgumentParser
-import os
-
 import asyncio
+import logging
+
 from langchain.agents import create_agent
-from langchain_ollama import ChatOllama
 from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
+from bot.netcode import (
+    BTCategory,
+    PlexAPIClient,
+    QBittorrentClient,
+    TorrentInfoResponse,
+)
 
-from bot.tools import check_for_album, search_for_albums, add_torrent, KnownTorrents
+from bot.tools import (
+    check_for_album,
+    check_for_movie,
+    search_for_torrent,
+    add_torrent,
+    TorrentContext,
+)
 from bot.config import Config
 
 logging.basicConfig(
@@ -32,10 +41,10 @@ async def on_ready():
 
     # Sync slash commands with Discord
     try:
-        synced_commands = await bot.tree.sync()
-        logger.info(f"{len(synced_commands)} Slash commands synced globally")
-        synced_commands = await bot.tree.sync(guild=server_guild)
-        logger.info(f"{len(synced_commands)} Slash commands synced in server guild")
+        num_commands = await bot.tree.sync()
+        logger.info(f"{len(num_commands)} Slash commands synced globally")
+        num_commands = await bot.tree.sync(guild=server_guild)
+        logger.info(f"{len(num_commands)} Slash commands synced in server guild")
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
@@ -48,41 +57,81 @@ async def ping(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="music", description="Search for albums")
+@bot.tree.command(name="query", description="Search for media")
 @discord.app_commands.describe(query="The query to send to chatgpt")
-async def music_query(interaction: discord.Interaction, query: str):
+async def query(interaction: discord.Interaction, query: str):
     load_dotenv()
-    logger.info(f"Received music query: {query}")
-    # llm = ChatOllama(
-    # model="gpt-oss:120b",
-    # base_url=Config.OLLAMA_API_URL,
-    # temperature=0,
-    # num_ctx=32000,
-    # )
     llm = ChatAnthropic(
         model_name="claude-sonnet-4-5-20250929",
-    )
+    )  # type: ignore
 
     agent = create_agent(
         llm,
-        tools=[search_for_albums, add_torrent, check_for_album],
-        context_schema=KnownTorrents,
+        tools=[search_for_torrent, add_torrent, check_for_album, check_for_movie],
+        context_schema=TorrentContext,
     )
     await interaction.response.defer()
+    torrent_context = TorrentContext(
+        search_results={}, internal_torrents={}, torrent_types=set()
+    )
     response = await agent.ainvoke(
         {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant that can search for torrents using qBittorrent. Based on the user's query, use the tool to find relevant torrents. Select the most appropriate torrents, prefer higher quality, and only choose a vinyl rip if the user specifically requests it. Provide the user with a concise summary of the top results. Then use the add_torrent tool to add the selected torrents. Some rules: \n - Do not ask follow up questions. Assume the user wants all torrents available. \n - If two torrents are similar enough that they may be the same album but one is a special release, only get the special release. \n - Do not ever download the same album in two formats.",
+                    "content": """
+                    You are a helpful assistant that can search for torrents using qBittorrent.
+                    You should interpret whether the user wants a movie or an album, and use the appropriate tools.
+                    Based on the user's query, use the tool to find relevant torrents.
+                    Select the most appropriate torrents, prefer higher quality, and only choose a vinyl rip if the user specifically requests it.
+                    Provide the user with a concise summary of the top results.
+                    Then use the add_torrent tool to add the selected torrents.
+                    Some rules:
+                        - Do not ask follow up questions. Assume the user wants all torrents available.
+                        - If two torrents are similar enough that they may be the same album but one is a special release, only get the special release.
+                        - Do not ever download the same album in two formats.
+                        """,
                 },
                 {"role": "user", "content": query},
             ]
         },
-        context=KnownTorrents(torrents={}),
+        context=torrent_context,
     )
     logger.info(f"Agent response: {response}")
     await interaction.followup.send(response["messages"][-1].content)
+    # Get torrent info for all added torrents, send a message when all of them are ready
+    torrent_sync_targets: dict[str, BTCategory] = {}
+    torrent_info: list[TorrentInfoResponse] = []
+    while True:
+        async with QBittorrentClient() as qclient:
+            for torrent in torrent_context.internal_torrents:
+                torrent_info_promises = []
+                for (
+                    content_path,
+                    memory_code,
+                ) in torrent_context.internal_torrents.items():
+                    if memory_code is None:
+                        continue
+                    torrent_info_promises.append(qclient.get_torrent_info(memory_code))
+                torrent_info = await asyncio.gather(*torrent_info_promises)
+                logger.info(f"Torrent info: {torrent_info}")
+            if all([info.progress == 1.0 for info in torrent_info]):
+                break
+            for info in torrent_info:
+                torrent_sync_targets[info.content_path] = BTCategory[info.category]
+            await asyncio.sleep(1)
+
+    # Trigger a plex sync
+    async with PlexAPIClient() as plex_client:
+        for content_path, category in torrent_sync_targets.items():
+            await plex_client.scan_media(content_path, category)
+
+    await interaction.followup.send(
+        f"""
+    The following files have been added to the server:\n\t-
+    {'\n\t- '.join(torrent_context.internal_torrents.keys())}
+    """
+    )
 
 
 if __name__ == "__main__":
