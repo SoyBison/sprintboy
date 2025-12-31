@@ -128,8 +128,8 @@ async def query(interaction: discord.Interaction, query: str):
 
     await interaction.followup.send(
         f"""
-    The following files have been added to the server:\n-
-    {'\n- '.join(torrent_context.internal_torrents.keys())}
+    The following files have been added to the server:\n
+    {'\n - '.join(torrent_context.internal_torrents.keys())}
     """
     )
 
