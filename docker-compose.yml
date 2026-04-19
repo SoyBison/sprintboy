@@ -6,8 +6,8 @@ services:
     container_name: sprintboy-dev
     restart: unless-stopped
     volumes:
-      - ./src:/app/src  # Hot reload source
-      - ./.env:/app/.env
+      - ./src:/app/src:z  # Hot reload source
+      - ./.env:/app/.env:z
     environment:
       - ENVIRONMENT=development
     env_file:

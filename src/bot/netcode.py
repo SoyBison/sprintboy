@@ -1,6 +1,7 @@
 from enum import StrEnum
 import logging
 import os
+from pathlib import Path
 from typing import Callable, TypeVar, List
 
 import aiohttp
@@ -272,7 +273,7 @@ class QBittorrentClient:
         return results_response
 
     async def add_torrent(self, torrent_url: str, category: BTCategory) -> str | None:
-        """Download a torrent from a given URL."""
+        """Submit a torrent URL to qBittorrent for download."""
         assert self.session is not None, "Session not initialized"
         download_url = f"{self.base_url}/torrents/add"
         logging.debug(f"Downloading torrent from URL: {torrent_url}")
@@ -287,27 +288,63 @@ class QBittorrentClient:
             logging.info(f"Dry run enabled, not downloading torrent: {torrent_url}")
             return
         async with self.session.post(download_url, data=payload) as response:
-            if response.status == 200:
-                if (await response.text()) == "Fails.":
-                    logging.error(f"Failed to add torrent: {await response.text()}")
-                    raise Exception("Download failed")
-                logging.debug(
-                    f"Torrent download initiated successfully for {torrent_url}"
-                )
-            else:
-                logging.error(
-                    f"Failed to initiate torrent download: {response.status}: {await response.text()}"
-                )
+            body = await response.text()
+            if response.status != 200 or body == "Fails.":
+                logging.error(f"Failed to add torrent: {response.status} {body}")
                 raise Exception("Download failed")
-            return memory_code
+            logging.debug(f"Torrent download initiated successfully for {torrent_url}")
+        return memory_code
 
-    async def get_torrent_info(self, memory_code: str) -> TorrentInfoResponse:
+    async def add_torrent_file(
+        self, torrent_path: Path, category: BTCategory, save_path: str | None = None
+    ) -> str | None:
+        """Submit a local .torrent file to qBittorrent for seeding."""
+        assert self.session is not None, "Session not initialized"
+        download_url = f"{self.base_url}/torrents/add"
+        memory_code = str(KsuidMs())
+        save = save_path or (self.torrent_path + "/" + category.capitalize())
+        payload = {
+            "savepath": save,
+            "category": category.capitalize(),
+            "tags": f"sprintboy_{memory_code}",
+        }
+        if self.dry_run:
+            logging.info(f"Dry run enabled, not adding torrent file: {torrent_path}")
+            return None
+        with open(torrent_path, "rb") as f:
+            form = aiohttp.FormData()
+            for k, v in payload.items():
+                form.add_field(k, v)
+            form.add_field(
+                "torrents",
+                f,
+                filename=torrent_path.name,
+                content_type="application/x-bittorrent",
+            )
+            async with self.session.post(download_url, data=form) as response:
+                body = await response.text()
+                if response.status != 200 or body == "Fails.":
+                    logging.error(f"Failed to add torrent file: {response.status} {body}")
+                    raise Exception("Failed to add torrent file")
+        logging.debug(f"Torrent file submitted successfully: {torrent_path}")
+        return memory_code
+
+    async def get_torrent_info(self, memory_code: str, timeout: float = 30.0) -> TorrentInfoResponse:
         assert self.session is not None, "Session not initialized"
         info_url = f"{self.base_url}/torrents/info"
         params = {"tag": f"sprintboy_{memory_code}"}
-        return (
-            await fetch_url(self.session, info_url, TorrentInfoResponses, params=params)
-        ).root[0]
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            result = await fetch_url(self.session, info_url, TorrentInfoResponses, params=params)
+            if result.root:
+                return result.root[0]
+            if asyncio.get_event_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"Torrent sprintboy_{memory_code} did not appear in qBittorrent "
+                    f"within {timeout}s. The torrent URL may be unreachable by qBittorrent "
+                    f"(check Jackett indexer authentication)."
+                )
+            await asyncio.sleep(0.5)
 
 
 class PlexAPIClient:

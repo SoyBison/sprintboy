@@ -1,11 +1,15 @@
 import pytest
 import json
+import asyncio
 
 import logging
 from bot.netcode import (
     QBittorrentClient,
     PlexAPIClient,
     SearchResultsResponse,
+    TorrentInfoResponses,
+    fetch_url,
+    BTCategory,
 )
 
 # Set up logging for debugging
@@ -68,13 +72,111 @@ class TestQBittorrentClient:
                 assert result.nbLeechers >= 0
 
     @pytest.mark.asyncio
+    async def test_add_torrent_appears_in_qbittorrent(self):
+        """
+        Integration test: adds a real torrent, then verifies it appears in
+        qBittorrent when queried by its sprintboy tag.
+
+        This test catches two failure modes:
+          1. add_torrent silently fails (torrent never added)
+          2. get_torrent_info tag query returns empty (lookup broken)
+
+        The test uses a magnet URI with a known-invalid hash so nothing is
+        actually downloaded, but the torrent entry IS created in qBittorrent.
+        """
+        test_magnet = (
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000001"
+            "&dn=sprintboy-integration-test"
+        )
+        async with QBittorrentClient() as client:
+            # Step 1: add the torrent and get back the memory_code tag
+            memory_code = await client.add_torrent(test_magnet, BTCategory.Music)
+            assert memory_code is not None, "add_torrent returned None (dry_run mode?)"
+
+            # Step 2: give qBittorrent a moment to register the entry
+            await asyncio.sleep(1)
+
+            # Step 3: query directly (bypassing the retry loop) to see raw result
+            assert client.session is not None
+            info_url = f"{client.base_url}/torrents/info"
+            params = {"tag": f"sprintboy_{memory_code}"}
+            result = await fetch_url(client.session, info_url, TorrentInfoResponses, params=params)
+
+            assert len(result.root) > 0, (
+                f"Torrent with tag sprintboy_{memory_code} not found in qBittorrent. "
+                "Either add_torrent failed silently or tag-based filtering is broken."
+            )
+            assert f"sprintboy_{memory_code}" in result.root[0].tags
+
+            # Cleanup: delete the test torrent
+            delete_url = f"{client.base_url}/torrents/delete"
+            torrent_hash = result.root[0].hash
+            async with client.session.post(
+                delete_url, data={"hashes": torrent_hash, "deleteFiles": "false"}
+            ) as resp:
+                assert resp.status == 200, f"Cleanup failed: {resp.status}"
+
+    @pytest.mark.asyncio
+    async def test_add_torrent_via_jackett_url_appears_in_qbittorrent(self):
+        """
+        Full pipeline test matching the real bot flow:
+          search → pick a result URL → add_torrent → verify tag lookup.
+
+        Unlike test_add_torrent_appears_in_qbittorrent which uses a magnet link,
+        this uses a real Jackett HTTP URL, which requires qBittorrent to fetch the
+        .torrent file from Jackett. If qBittorrent can't reach Jackett, the torrent
+        entry will not appear and this test will fail.
+
+        Also prints the torrent state so we can see if it's downloading/stalled/error.
+        """
+        async with QBittorrentClient() as client:
+            # Search for something that definitely has results
+            results = await client.search("Herbie Hancock Head Hunters")
+            assert results.results, "Search returned no results — is qBittorrent search working?"
+
+            # Pick the first FLAC result with a fileUrl and use its real Jackett URL
+            flac_results = [r for r in results.results if "FLAC" in r.fileName]
+            assert flac_results, "No FLAC results found"
+            first = flac_results[0]
+            print(f"\n  Torrent name: {first.fileName}")
+            print(f"  URL (first 100 chars): {first.fileUrl[:100]}")
+
+            assert client.session is not None
+            memory_code = await client.add_torrent(first.fileUrl, BTCategory.Music)
+            assert memory_code is not None
+
+            # Poll for up to 10 seconds — qBittorrent needs time to fetch from Jackett
+            info_url = f"{client.base_url}/torrents/info"
+            params = {"tag": f"sprintboy_{memory_code}"}
+            result = None
+            for _ in range(10):
+                await asyncio.sleep(1)
+                result = await fetch_url(client.session, info_url, TorrentInfoResponses, params=params)
+                if result.root:
+                    break
+
+            assert result is not None and len(result.root) > 0, (
+                "Torrent added via Jackett URL did not appear in qBittorrent after 10s.\n"
+                "qBittorrent cannot reach the Jackett URL — the bot is silently failing to add torrents."
+            )
+            info = result.root[0]
+            print(f"  Torrent state: {info.state!r}, progress: {info.progress:.0%}")
+
+            # Cleanup
+            delete_url = f"{client.base_url}/torrents/delete"
+            async with client.session.post(
+                delete_url, data={"hashes": info.hash, "deleteFiles": "false"}
+            ) as resp:
+                assert resp.status == 200
+
+    @pytest.mark.asyncio
     async def test_add_torrent_dry_run(self):
         """Test add torrent in dry run mode (if configured)."""
         async with QBittorrentClient() as client:
             if client.dry_run:
                 # This should not actually download anything
                 test_url = "magnet:?xt=urn:btih:test"
-                await client.add_torrent(test_url)
+                await client.add_torrent(test_url, BTCategory.Music)
                 print("✓ Dry run add_torrent completed without error")
             else:
                 print("⚠ Skipping add_torrent test (dry_run not enabled)")

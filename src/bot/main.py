@@ -104,17 +104,16 @@ async def query(interaction: discord.Interaction, query: str):
     torrent_info: list[TorrentInfoResponse] = []
     while True:
         async with QBittorrentClient() as qclient:
-            for torrent in torrent_context.internal_torrents:
-                torrent_info_promises = []
-                for (
-                    content_path,
-                    memory_code,
-                ) in torrent_context.internal_torrents.items():
-                    if memory_code is None:
-                        continue
-                    torrent_info_promises.append(qclient.get_torrent_info(memory_code))
-                torrent_info = await asyncio.gather(*torrent_info_promises)
-                logger.info(f"Torrent info: {torrent_info}")
+            torrent_info_promises = []
+            for (
+                content_path,
+                memory_code,
+            ) in torrent_context.internal_torrents.items():
+                if memory_code is None:
+                    continue
+                torrent_info_promises.append(qclient.get_torrent_info(memory_code))
+            torrent_info = await asyncio.gather(*torrent_info_promises)
+            logger.info(f"Torrent info: {torrent_info}")
             if all([info.progress == 1.0 for info in torrent_info]):
                 break
             for info in torrent_info:

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.13.1",
+    "click>=8.1.0",
     "cyksuid>=2.1.0",
     "discord>=2.3.2",
     "langchain>=1.0.2",
@@ -16,6 +17,7 @@ dependencies = [
     "pytest-asyncio>=1.2.0",
     "python-dotenv>=1.1.1",
     "thefuzz>=0.22.1",
+    "torf>=4.3.0",
 ]
 
 [dependency-groups]
@@ -27,6 +29,10 @@ dev = [
     "pyright>=1.1.407",
     "ruff>=0.14.2",
 ]
+
+[project.scripts]
+upload-album = "bot.upload_cli:upload_album"
+seed-torrent = "bot.upload_cli:seed_torrent"
 
 [build-system]
 requires = ["hatchling"]
