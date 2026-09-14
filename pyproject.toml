@@ -33,6 +33,8 @@ dev = [
 [project.scripts]
 upload-album = "bot.upload_cli:upload_album"
 seed-torrent = "bot.upload_cli:seed_torrent"
+transcode-album = "bot.transcode_cli:transcode_album"
+find-opportunities = "bot.opportunity_cli:find_opportunities"
 
 [build-system]
 requires = ["hatchling"]

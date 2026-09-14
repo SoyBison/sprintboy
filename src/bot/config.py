@@ -9,6 +9,13 @@ class Config:
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
     DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
+    # Comma separated channel ids the bot will answer in. Empty means every
+    # channel it can see.
+    DISCORD_CHANNEL_IDS = [
+        channel_id.strip()
+        for channel_id in os.getenv("DISCORD_CHANNEL_IDS", "").split(",")
+        if channel_id.strip()
+    ]
     # Add more config as needed
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

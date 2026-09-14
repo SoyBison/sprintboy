@@ -329,6 +329,17 @@ class QBittorrentClient:
         logging.debug(f"Torrent file submitted successfully: {torrent_path}")
         return memory_code
 
+    async def list_torrents(self, category: BTCategory | None = None) -> list[TorrentInfoResponse]:
+        """Return all torrents, optionally filtered to a category, that are fully downloaded."""
+        assert self.session is not None, "Session not initialized"
+        params: dict = {"filter": "completed"}
+        if category:
+            params["category"] = category.capitalize()
+        result = await fetch_url(
+            self.session, f"{self.base_url}/torrents/info", TorrentInfoResponses, params=params
+        )
+        return result.root
+
     async def get_torrent_info(self, memory_code: str, timeout: float = 30.0) -> TorrentInfoResponse:
         assert self.session is not None, "Session not initialized"
         info_url = f"{self.base_url}/torrents/info"
