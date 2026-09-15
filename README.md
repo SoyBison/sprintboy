@@ -21,6 +21,14 @@ uv run main.py "Query to send to the agent."
 
 - Sprintboy can check your plex server to make sure its not downloading the same album just in a different format.
 
+- Sprintboy uses Last.fm for artist and album metadata, so recommendations and discographies
+  come from a live database rather than the model's training data.
+    - Artist and album names are canonicalised through Last.fm before the Plex check, so a
+      request for "Guns and Roses" still matches the "Guns N' Roses" already in your library.
+    - Set `LASTFM_API_KEY` in `.env` to enable it (get a key at
+      https://www.last.fm/api/account/create). Without it the bot still works, but it falls
+      back to the model's own knowledge and to exact-name matching against Plex.
+
 ## Use-Cases
 
 - Sprintboy excels over a simple torrent search because it can interpret vague queries.
@@ -35,6 +43,5 @@ uv run main.py "Introduce me to new music in the future jazz style."
 
 ## Planned Features
 
-- Last.fm integration to get up-to-date artist information and recommendations.
 - Bandcamp integration to help you find independent artists.
 

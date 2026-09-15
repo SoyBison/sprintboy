@@ -16,6 +16,11 @@ from bot.netcode import (
 from bot.tools import (
     check_for_album,
     check_for_movie,
+    lastfm_artist_albums,
+    lastfm_artist_info,
+    lastfm_browse_tag,
+    lastfm_resolve,
+    lastfm_similar_artists,
     search_for_torrent,
     add_torrent,
     TorrentContext,
@@ -41,16 +46,34 @@ MAX_HISTORY_DEPTH = 20
 MAX_TRACKED_CONVERSATIONS = 50
 
 SYSTEM_PROMPT = """
-You are a helpful assistant that can search for torrents using qBittorrent.
-You should interpret whether the user wants a movie or an album, and use the appropriate tools.
-Based on the user's query, use the tool to find relevant torrents.
-Select the most appropriate torrents, prefer higher quality, and only choose a vinyl rip if the user specifically requests it.
-Provide the user with a concise summary of the top results.
-Then use the add_torrent tool to add the selected torrents.
+You are a helpful assistant that adds music, movies and TV to the user's Plex server by
+searching for torrents in qBittorrent.
+First work out whether the user wants music, a movie, or a TV show, and use the tools for that kind of media.
+
+For music, follow this order:
+    1. Establish what actually exists using the Last.fm tools. Do not rely on your own
+       recollection of an artist's discography, album titles or which artists sound alike:
+       your training data is stale and you will invent releases that were never made.
+       - lastfm_artist_albums for an artist's real releases and their real spellings
+       - lastfm_similar_artists and lastfm_browse_tag for recommendations and styles
+       - lastfm_artist_info to learn what an artist sounds like and which tags to follow
+       - lastfm_resolve to turn a vague or misspelled name into the real release name
+    2. Call check_for_album for every album you are considering. It canonicalises the
+       names through Last.fm and fuzzy matches the whole library, so trust its answer:
+       if it reports a COLLISION, drop that album and say so. If it reports a possible
+       match, decide for yourself whether it is the same release.
+    3. Search for the remaining albums with search_for_torrent, using the Last.fm
+       spelling of the artist and album.
+    4. Add the ones you picked with add_torrent, then summarise concisely what you added
+       and what you skipped because the user already had it.
+
 Some rules:
     - Do not ask follow up questions. Assume the user wants all torrents available.
+    - Prefer higher quality, and only choose a vinyl rip if the user specifically requests it.
     - If two torrents are similar enough that they may be the same album but one is a special release, only get the special release.
     - Do not ever download the same album in two formats.
+    - If a Last.fm tool errors, say so and carry on with the torrent search rather than
+      giving up, but do not substitute guessed album names for the ones you could not verify.
 """
 
 # Keyed by the id of the message that started a conversation, so that a reply
@@ -70,7 +93,17 @@ def get_agent():
         )  # type: ignore
         _agent = create_agent(
             llm,
-            tools=[search_for_torrent, add_torrent, check_for_album, check_for_movie],
+            tools=[
+                search_for_torrent,
+                add_torrent,
+                check_for_album,
+                check_for_movie,
+                lastfm_artist_info,
+                lastfm_similar_artists,
+                lastfm_artist_albums,
+                lastfm_browse_tag,
+                lastfm_resolve,
+            ],
             context_schema=TorrentContext,
         )
     return _agent
