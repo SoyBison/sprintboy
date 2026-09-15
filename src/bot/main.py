@@ -2,7 +2,6 @@ import asyncio
 import logging
 
 from langchain.agents import create_agent
-from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
@@ -25,12 +24,18 @@ from bot.tools import (
     add_torrent,
     TorrentContext,
 )
-from bot.config import Config
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+from bot.output import (
+    best_reply,
+    describe_failure,
+    name_list,
+    split_for_discord,
+    summarise_run,
 )
+from bot.config import Config, setup_logging
+
+# Honour LOG_LEVEL: this was pinned to DEBUG, which made the deployed logs
+# unreadable and rolled the container's 50m of history in minutes.
+setup_logging()
 logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
@@ -74,6 +79,16 @@ Some rules:
     - Do not ever download the same album in two formats.
     - If a Last.fm tool errors, say so and carry on with the torrent search rather than
       giving up, but do not substitute guessed album names for the ones you could not verify.
+
+Your reply is posted straight into a Discord chat, so:
+    - Always finish with a reply. Never stop after a tool call without saying what happened.
+    - Write it to the person who asked, as "you", and never refer to them as "the user".
+    - Say what you added and what you skipped, naming the albums. If you added nothing, say
+      why in one line.
+    - No preamble, no restating the request, no notes about your own process, tool names or
+      reasoning, and no lists of steps you are about to take.
+    - Keep it short: a sentence or two, plus a list of album names if there is one. Leave out
+      any list that would be empty.
 """
 
 # Keyed by the id of the message that started a conversation, so that a reply
@@ -83,27 +98,58 @@ conversation_contexts: dict[int, TorrentContext] = {}
 _agent = None
 
 
+def build_llm():
+    """Build the chat model for the configured backend.
+
+    Imported lazily so that running on one backend does not require the other's
+    package to be installed or its credentials to be present.
+    """
+    Config.validate_llm()
+    if Config.LLM_PROVIDER == "ollama":
+        from langchain_ollama import ChatOllama
+
+        logger.info(
+            f"Using ollama model {Config.OLLAMA_MODEL} at {Config.OLLAMA_API_URL}"
+        )
+        return ChatOllama(
+            model=Config.OLLAMA_MODEL,
+            base_url=Config.OLLAMA_API_URL,
+            num_ctx=Config.OLLAMA_NUM_CTX,
+            # The agent picks between concrete torrents and album titles, so a
+            # creative model just invents releases that were not in the results.
+            temperature=0,
+            # Fail at startup with a clear message rather than on the first
+            # message with a 404 from a model that was never pulled.
+            validate_model_on_init=Config.OLLAMA_VALIDATE_MODEL,
+        )
+
+    from langchain_anthropic import ChatAnthropic
+
+    logger.info(f"Using anthropic model {Config.ANTHROPIC_MODEL}")
+    return ChatAnthropic(model_name=Config.ANTHROPIC_MODEL)  # type: ignore
+
+
+AGENT_TOOLS = [
+    search_for_torrent,
+    add_torrent,
+    check_for_album,
+    check_for_movie,
+    lastfm_artist_info,
+    lastfm_similar_artists,
+    lastfm_artist_albums,
+    lastfm_browse_tag,
+    lastfm_resolve,
+]
+
+
 def get_agent():
     """Build the agent once and reuse it across messages."""
     global _agent
     if _agent is None:
         load_dotenv()
-        llm = ChatAnthropic(
-            model_name="claude-sonnet-4-5-20250929",
-        )  # type: ignore
         _agent = create_agent(
-            llm,
-            tools=[
-                search_for_torrent,
-                add_torrent,
-                check_for_album,
-                check_for_movie,
-                lastfm_artist_info,
-                lastfm_similar_artists,
-                lastfm_artist_albums,
-                lastfm_browse_tag,
-                lastfm_resolve,
-            ],
+            build_llm(),
+            tools=AGENT_TOOLS,
             context_schema=TorrentContext,
         )
     return _agent
@@ -119,21 +165,6 @@ def get_conversation_context(root_id: int) -> TorrentContext:
         while len(conversation_contexts) > MAX_TRACKED_CONVERSATIONS:
             conversation_contexts.pop(next(iter(conversation_contexts)))
     return context
-
-
-def message_text(content) -> str:
-    """Flatten an LLM message content into plain text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return "\n".join(part for part in parts if part)
-    return str(content)
 
 
 async def build_conversation(
@@ -178,12 +209,9 @@ async def reply_in_chunks(message: discord.Message, text: str) -> discord.Messag
     Each chunk replies to the previous one so the conversation stays a single
     chain, and returns the last message sent.
     """
-    text = text.strip() or "Done."
     target = message
-    for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
-        target = await target.reply(
-            text[start : start + DISCORD_MESSAGE_LIMIT], mention_author=False
-        )
+    for chunk in split_for_discord(text.strip(), DISCORD_MESSAGE_LIMIT) or ["Done."]:
+        target = await target.reply(chunk, mention_author=False)
     return target
 
 
@@ -222,10 +250,8 @@ async def wait_for_downloads(
 
     await reply_in_chunks(
         message,
-        f"""
-    The following files have been added to the server:\n
-    {"\n - ".join(new_torrents)}
-    """,
+        f"Finished downloading, and Plex has been told to scan:\n"
+        f"{name_list(new_torrents)}",
     )
 
 
@@ -280,17 +306,17 @@ async def on_message(message: discord.Message):
             )
         except Exception as e:
             logger.exception("Agent invocation failed")
-            await reply_in_chunks(message, f"Something went wrong: {e}")
+            await reply_in_chunks(message, describe_failure(e))
             return
 
-    logger.info(f"Agent response: {response}")
-    last_message = await reply_in_chunks(
-        message, message_text(response["messages"][-1].content)
-    )
-
+    logger.info(summarise_run(response["messages"]))
     new_torrents = [
         name for name in torrent_context.internal_torrents if name not in known_torrents
     ]
+    last_message = await reply_in_chunks(
+        message, best_reply(response["messages"], new_torrents)
+    )
+
     if new_torrents:
         await wait_for_downloads(last_message, torrent_context, new_torrents)
 
