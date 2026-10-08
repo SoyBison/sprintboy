@@ -10,10 +10,14 @@ from bot.netcode import (
     CanonicalRelease,
     LastFMClient,
     LastFMError,
+    MBReleaseGroup,
+    MusicBrainzClient,
+    MusicBrainzError,
     QBittorrentClient,
     SearchResult,
     PlexAPIClient,
     PLEX_CONTENT_TYPES,
+    artist_catalogue,
     resolve_release,
 )
 from bot.decide import decide
@@ -282,6 +286,26 @@ async def _canonicalise(artist: str, title: str | None) -> CanonicalRelease:
             album=title,
             album_candidates=[title] if title else [],
         )
+
+
+# Long enough for an id lookup plus a few browse pages at one request a second.
+MUSICBRAINZ_TIMEOUT = 10.0
+
+
+async def _musicbrainz_catalogue(
+    artist: str, mbid: str | None = None, types: tuple[str, ...] = ("album", "ep")
+) -> list[MBReleaseGroup] | None:
+    """The artist's release groups from MusicBrainz, or None if it is down or does not know them.
+
+    Like canonicalisation this only sharpens a result, so a slow or missing
+    MusicBrainz must never stop a workflow.
+    """
+    try:
+        found = await asyncio.wait_for(artist_catalogue(artist, mbid, types), MUSICBRAINZ_TIMEOUT)
+    except (MusicBrainzError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logging.info(f"MusicBrainz unavailable for {artist}: {e}")
+        return None
+    return found[1] if found else None
 
 
 _ROMAN = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"}
@@ -882,6 +906,64 @@ async def lastfm_resolve(artist: str, album: str | None = None) -> str:
         lines.append(f"Album MusicBrainz id: {release.album_mbid}")
     lines.append(f"Use this for torrent searches: {release.artist} {release.album or ''}".strip())
     return "\n".join(lines)
+
+
+class MusicBrainzDiscographyQuery(BaseModel):
+    artists: list[str]
+    include_other: bool = False
+
+    @field_validator("artists", mode="before")
+    @classmethod
+    def _wrap_artists(cls, value):
+        return _str_to_list(value)
+
+
+async def _discography_section(artist: str, include_other: bool) -> str:
+    release = await _canonicalise(artist, None)
+    async with MusicBrainzClient() as mb:
+        found = await mb.find_artist(release.artist, release.artist_mbid)
+        if found is None:
+            return f"MusicBrainz has no artist matching {artist}."
+        groups = await mb.get_release_groups(found.mbid)
+    shown = groups if include_other else [g for g in groups if g.studio]
+    if not shown:
+        return f"MusicBrainz lists no studio albums for {found.name}."
+    owned = (await _library_lookup([found.name]))[found.name]
+    marks = await _resolve_maybes(found.name, [g.title for g in shown], owned)
+    listing = "\n".join(
+        f"- {g.title}"
+        + (f" ({g.year})" if g.year else "")
+        + (f" [{g.kind}]" if include_other else "")
+        + marks[g.title]
+        for g in shown
+    )
+    what = "Releases" if include_other else "Studio albums"
+    new = sum(1 for g in shown if marks[g.title] == "")
+    return (
+        f"{what} by {found.name} on MusicBrainz, oldest first:\n{listing}\n"
+        f"{new} of these are not in the library."
+    )
+
+
+@tool(args_schema=MusicBrainzDiscographyQuery)
+async def musicbrainz_discography(artists: list[str], include_other: bool = False) -> str:
+    """
+    List an artist's studio albums from MusicBrainz, oldest first with release years. Pass
+    every artist you are considering in one call. Unlike lastfm_artist_albums this leaves
+    out live albums, remixes and compilations, so use it for discography requests. Set
+    include_other to also list EPs, live albums and compilations, each labelled with its type.
+    Albums are marked [OWNED] / [maybe owned as ...] when the user's library has them.
+    """
+    results = await asyncio.gather(
+        *[_discography_section(artist, include_other) for artist in artists],
+        return_exceptions=True,
+    )
+    return "\n\n".join(
+        f"MusicBrainz lookup for {artist} failed: {result}"
+        if isinstance(result, BaseException)
+        else result
+        for artist, result in zip(artists, results)
+    )
 
 
 class DownloadAlbumsQuery(BaseModel):

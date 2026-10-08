@@ -6,7 +6,7 @@ import pytest
 from bot import turn, workflows
 from bot.decide import Decision
 from bot.llm import system, user
-from bot.netcode import BTCategory, CanonicalRelease, SearchResult
+from bot.netcode import BTCategory, CanonicalRelease, MBReleaseGroup, SearchResult
 from bot.routing import Route
 from bot.tools import TorrentContext
 from bot.workflows import WorkflowResult, candidate_spans, discography
@@ -57,6 +57,7 @@ async def _run(
     same=None,
     add=None,
     ctx=None,
+    groups=None,
     **kwargs,
 ):
     ctx = ctx or _ctx()
@@ -72,6 +73,7 @@ async def _run(
         add=add or AsyncMock(side_effect=_add),
         same=same or AsyncMock(return_value=None),
         client=client,
+        catalogue=AsyncMock(return_value=groups),
     )
     with patch("bot.workflows.decide", AsyncMock(return_value=decision or _decision())), patch(
         "bot.workflows._canonicalise", AsyncMock(return_value=canon)
@@ -79,7 +81,7 @@ async def _run(
         "bot.workflows._library_lookup", AsyncMock(return_value=lookup)
     ), patch("bot.workflows._same_release", mocks.same), patch(
         "bot.workflows._add_one", mocks.add
-    ):
+    ), patch("bot.workflows._musicbrainz_catalogue", mocks.catalogue):
         result = await discography(text, ctx, **kwargs)
     return result, ctx, mocks
 
@@ -216,6 +218,76 @@ async def test_duplicate_versions_of_one_album_add_one():
     other = "Khruangbin - Con todo el mundo [2019] [EP] FLAC / Lossless / CD [Orpheus]"
     _, _, mocks = await _run([CON_TODO_WEB, other], decision=_decision(scope="everything"))
     assert _added_names(mocks) == [CON_TODO_WEB]
+
+
+def _group(title, year, primary="Album", secondary=()):
+    return MBReleaseGroup(
+        mbid=f"mb-{title}", title=title, primary_type=primary,
+        secondary_types=list(secondary), year=year,
+    )
+
+
+KHRUANGBIN_MB = [
+    _group("The Universe Smiles Upon You", 2015),
+    _group("Con todo el mundo", 2018),
+    _group("Hasta El Cielo (Con Todo El Mundo in Dub)", 2019, secondary=["Remix"]),
+    _group("Mordechai", 2020),
+    _group("Live at Stubb's", 2023, secondary=["Live"]),
+    _group("A LA SALA", 2024),
+    _group("Texas Moon", 2022, primary="EP"),
+]
+LIVE_AS_ALBUM = "Khruangbin - Live at Stubb's [2023] [Album] FLAC / Lossless / WEB [Orpheus]"
+
+
+@pytest.mark.asyncio
+async def test_musicbrainz_drops_albums_that_are_not_studio_albums():
+    names = [MORDECHAI, CON_TODO_WEB, MAYBE, LIVE_AS_ALBUM, NEWEST]
+    result, _, mocks = await _run(names, groups=KHRUANGBIN_MB)
+    assert _added_names(mocks) == sorted([CON_TODO_WEB, NEWEST])
+    assert (
+        "Left out because they aren't studio albums: Hasta el Cielo (remix album), "
+        "Live at Stubb's (live album)" in result.reply
+    )
+    mocks.catalogue.assert_awaited_once_with("Khruangbin", None)
+    step = next(s for s in result.steps if s.name == "discography/musicbrainz")
+    assert step.result == "4 studio albums of 7 groups"
+
+
+@pytest.mark.asyncio
+async def test_musicbrainz_lists_studio_albums_with_no_torrent():
+    result, _, _ = await _run([MORDECHAI, CON_TODO_WEB], groups=KHRUANGBIN_MB)
+    # Mordechai is owned, Texas Moon is an EP, and the rest were on the tracker.
+    assert "No torrent found for: The Universe Smiles Upon You (2015), A LA SALA (2024)" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_musicbrainz_keeps_titles_it_does_not_know():
+    unknown = "Khruangbin - Something New [2026] [Album] FLAC / Lossless / WEB [Orpheus]"
+    result, _, mocks = await _run([unknown, LIVE_AS_ALBUM], groups=KHRUANGBIN_MB)
+    assert _added_names(mocks) == [unknown]
+
+
+@pytest.mark.asyncio
+async def test_studio_album_sharing_a_title_with_a_live_one_is_kept():
+    groups = [_group("Mordechai", 2020), _group("Mordechai", 2021, secondary=["Live"])]
+    _, _, mocks = await _run([MORDECHAI], owned=(), groups=groups)
+    assert _added_names(mocks) == [MORDECHAI]
+
+
+@pytest.mark.asyncio
+async def test_without_musicbrainz_the_workflow_is_unchanged():
+    result, _, mocks = await _run([MORDECHAI, CON_TODO_WEB, MAYBE], groups=None)
+    assert _added_names(mocks) == sorted([CON_TODO_WEB, MAYBE])
+    assert "studio albums" not in result.reply and "No torrent found" not in result.reply
+    step = next(s for s in result.steps if s.name == "discography/musicbrainz")
+    assert step.result == "unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["everything", "newest"])
+async def test_musicbrainz_is_only_asked_for_the_albums_scope(scope):
+    _, _, mocks = await _run([NEWEST], owned=(), decision=_decision(scope=scope), groups=KHRUANGBIN_MB)
+    mocks.catalogue.assert_not_called()
 
 
 def test_to_agent_result():

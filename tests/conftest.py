@@ -67,3 +67,18 @@ def no_decision_backends(monkeypatch):
 
     monkeypatch.setattr(Config, "DECISION_PRIMARY", "off")
     monkeypatch.setattr(Config, "DECISION_SHADOW", "off")
+
+
+@pytest.fixture(autouse=True)
+def no_musicbrainz(monkeypatch):
+    """Unit tests never reach musicbrainz.org.
+
+    Every MusicBrainz use is best effort, so an offline client exercises the
+    fallback path; tests that want a catalogue patch it in themselves.
+    """
+    from bot.netcode import MusicBrainzClient, MusicBrainzError
+
+    async def offline(self, path, **params):
+        raise MusicBrainzError("MusicBrainz is offline in unit tests")
+
+    monkeypatch.setattr(MusicBrainzClient, "_get", offline)

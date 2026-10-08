@@ -50,6 +50,16 @@ the client gives up before the first token.
       https://www.last.fm/api/account/create). Without it the bot still works, but it falls
       back to the model's own knowledge and to exact-name matching against Plex.
 
+- Sprintboy uses MusicBrainz to tell studio albums apart from live albums, remixes and
+  compilations, which Last.fm can't do.
+    - A discography request skips torrents tagged [Album] that MusicBrainz files as live,
+      remix or compilation, and lists the studio albums it found no torrent for.
+    - The agent has a `musicbrainz_discography` tool that lists studio albums with years.
+    - No key needed. MusicBrainz asks clients to identify themselves, so set
+      `MUSICBRAINZ_CONTACT` in `.env` to an email or URL. Requests are throttled to one a
+      second, as their API rules require. If MusicBrainz is down, discographies work as
+      before.
+
 ## Use-Cases
 
 - Sprintboy excels over a simple torrent search because it can interpret vague queries.

@@ -1,6 +1,7 @@
 from enum import StrEnum
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar, List
 
@@ -10,7 +11,7 @@ import asyncio
 from pydantic import BaseModel, RootModel
 from cyksuid.v2 import KsuidMs
 
-from thefuzz import process
+from thefuzz import fuzz, process
 
 from yarl import URL
 
@@ -1035,3 +1036,249 @@ async def resolve_release(artist: str, album: str | None = None) -> CanonicalRel
         album_mbid=album_mbid,
         corrected=bool(correction) and correction.name.casefold() != artist.casefold(),
     )
+
+
+MUSICBRAINZ_API_ROOT = "https://musicbrainz.org/ws/2/"
+# MusicBrainz blocks anonymous clients and asks for "app/version ( contact )".
+MUSICBRAINZ_USER_AGENT = "sprintboy/1.0 ( {contact} )"
+# Their limit is one request per second per client, averaged; going over gets 503s.
+MUSICBRAINZ_INTERVAL = 1.0
+MUSICBRAINZ_RETRIES = 2
+# A browse page holds at most 100; past a few pages it is bootlegs and broadcasts.
+MUSICBRAINZ_PAGE = 100
+MUSICBRAINZ_MAX_PAGES = 3
+# Search scores are 0-100; below this the top hit is usually a different artist.
+MUSICBRAINZ_MIN_SCORE = 90
+
+
+class MusicBrainzError(Exception):
+    """Raised when MusicBrainz is unreachable, rate limits us out, or answers nonsense."""
+
+
+class MBArtist(BaseModel):
+    mbid: str
+    name: str
+    score: int | None = None
+    disambiguation: str | None = None
+    aliases: List[str] = []
+
+
+class MBReleaseGroup(BaseModel):
+    """One album/EP/single as MusicBrainz groups it: every edition of a release together."""
+
+    mbid: str
+    title: str
+    primary_type: str | None = None  # Album, EP, Single, Broadcast, Other
+    secondary_types: List[str] = []  # Live, Compilation, Remix, DJ-mix, Soundtrack, ...
+    year: int | None = None
+
+    @property
+    def studio(self) -> bool:
+        """A plain studio album: what "the discography" means unless asked for more."""
+        return self.primary_type == "Album" and not self.secondary_types
+
+    @property
+    def kind(self) -> str:
+        """Human label: "Album", "EP", "Live Album", "Compilation Album", ..."""
+        primary = self.primary_type or "Release"
+        if not self.secondary_types:
+            return primary
+        return f"{' '.join(self.secondary_types)} {primary}"
+
+
+def _mb_year(date) -> int | None:
+    """MusicBrainz dates are "YYYY", "YYYY-MM" or "YYYY-MM-DD", or "" when unknown."""
+    if isinstance(date, str) and len(date) >= 4 and date[:4].isdigit():
+        return int(date[:4])
+    return None
+
+
+def _parse_mb_artist(raw: dict) -> MBArtist | None:
+    mbid, name = raw.get("id"), raw.get("name")
+    if not isinstance(mbid, str) or not isinstance(name, str) or not name.strip():
+        return None
+    return MBArtist(
+        mbid=mbid,
+        name=name.strip(),
+        score=_lastfm_int(raw.get("score")),
+        disambiguation=_lastfm_str(raw.get("disambiguation")),
+        aliases=dedupe_casefold(
+            [a.get("name") for a in raw.get("aliases") or [] if isinstance(a, dict)]
+        ),
+    )
+
+
+def _parse_mb_release_group(raw: dict) -> MBReleaseGroup | None:
+    mbid, title = raw.get("id"), raw.get("title")
+    if not isinstance(mbid, str) or not isinstance(title, str) or not title.strip():
+        return None
+    secondary = raw.get("secondary-types") or []
+    return MBReleaseGroup(
+        mbid=mbid,
+        title=title.strip(),
+        primary_type=_lastfm_str(raw.get("primary-type")),
+        secondary_types=[s for s in secondary if isinstance(s, str) and s],
+        year=_mb_year(raw.get("first-release-date")),
+    )
+
+
+class _Throttle:
+    """Space requests at least `interval` apart across every client in the process.
+
+    The lock is rebuilt per event loop: asyncio.Lock binds to the first loop
+    that waits on it, and the CLIs and tests each run their own loop.
+    """
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._last = 0.0
+        self._lock: asyncio.Lock | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._loop is not loop:
+            self._lock, self._loop = asyncio.Lock(), loop
+        await self._lock.acquire()
+        wait = self._last + self.interval - loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        assert self._loop is not None and self._lock is not None
+        self._last = self._loop.time()
+        self._lock.release()
+
+
+_MB_THROTTLE = _Throttle(MUSICBRAINZ_INTERVAL)
+
+
+class MusicBrainzClient(AsyncAPIClient):
+    """Read-only MusicBrainz client for release types and dates.
+
+    Last.fm knows what is popular but not what a release is: its top albums
+    mix studio records with live sets, remixes and compilations. MusicBrainz
+    files every release group under a primary type and secondary types, which
+    is what "just the studio albums" needs. No key, but a contact in the
+    User-Agent and one request a second.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.base_url = os.getenv("MUSICBRAINZ_API_URL", MUSICBRAINZ_API_ROOT).rstrip("/") + "/"
+        contact = os.getenv("MUSICBRAINZ_CONTACT", "").strip() or "self-hosted Plex helper"
+        self.user_agent = MUSICBRAINZ_USER_AGENT.format(contact=contact)
+
+    def _new_session(self) -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(
+            headers={"User-Agent": self.user_agent, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+
+    async def _get(self, path: str, **params) -> dict:
+        session = self._live_session
+        query = {"fmt": "json", **{k: str(v) for k, v in params.items() if v is not None}}
+        url = self.base_url + path.lstrip("/")
+        for attempt in range(MUSICBRAINZ_RETRIES + 1):
+            async with _MB_THROTTLE:
+                logging.debug(f"MusicBrainz request {path} {params}")
+                async with session.get(url, params=query) as response:
+                    # 503 is their rate limiter; anything else is a real failure.
+                    if response.status == 503 and attempt < MUSICBRAINZ_RETRIES:
+                        await asyncio.sleep(MUSICBRAINZ_INTERVAL * (attempt + 1))
+                        continue
+                    if response.status == 404:
+                        raise MusicBrainzError(f"MusicBrainz has nothing at {path}")
+                    if response.status >= 400:
+                        raise MusicBrainzError(f"MusicBrainz {path} failed with HTTP {response.status}")
+                    body = await response.json(content_type=None)
+                    if not isinstance(body, dict):
+                        raise MusicBrainzError(f"MusicBrainz {path} returned an unexpected payload")
+                    return body
+        raise MusicBrainzError(f"MusicBrainz {path} kept rate limiting us")
+
+    async def search_artists(self, name: str, limit: int = 5) -> list[MBArtist]:
+        """Artist matches for a name, best first, each with a 0-100 score."""
+        # Quoted so "Boards of Canada" is a phrase, not three OR'd words.
+        phrase = name.replace("\\", " ").replace('"', " ").strip()
+        body = await self._get("artist", query=f'artist:"{phrase}" OR alias:"{phrase}"', limit=limit)
+        parsed = (_parse_mb_artist(raw) for raw in body.get("artists") or [] if isinstance(raw, dict))
+        return [artist for artist in parsed if artist]
+
+    async def get_artist(self, mbid: str) -> MBArtist:
+        """Look an artist up by id. MusicBrainz follows merges, so a stale id still resolves."""
+        body = await self._get(f"artist/{mbid}", inc="aliases")
+        artist = _parse_mb_artist(body)
+        if artist is None:
+            raise MusicBrainzError(f"MusicBrainz returned no artist for {mbid}")
+        return artist
+
+    async def get_release_groups(
+        self, artist_mbid: str, types: Sequence[str] = ("album", "ep")
+    ) -> list[MBReleaseGroup]:
+        """Every officially released group credited to the artist, oldest first.
+
+        `types` filters on primary type only, so live albums, remixes and
+        compilations still come back as "album"; use `studio` to drop them.
+        """
+        groups: list[MBReleaseGroup] = []
+        for page in range(MUSICBRAINZ_MAX_PAGES):
+            body = await self._get(
+                "release-group",
+                artist=artist_mbid,
+                type="|".join(types) if types else None,
+                # Only groups with an official release: without it a popular
+                # artist's catalogue is mostly bootlegs filed as studio albums.
+                **{"release-group-status": "website-default"},
+                limit=MUSICBRAINZ_PAGE,
+                offset=page * MUSICBRAINZ_PAGE,
+            )
+            raw = [g for g in body.get("release-groups") or [] if isinstance(g, dict)]
+            groups.extend(g for g in map(_parse_mb_release_group, raw) if g)
+            total = _lastfm_int(body.get("release-group-count")) or 0
+            if not raw or (page + 1) * MUSICBRAINZ_PAGE >= total:
+                break
+        # Undated groups last: they are mostly unofficial or not yet released.
+        return sorted(groups, key=lambda g: (g.year is None, g.year or 0, g.title.casefold()))
+
+    async def find_artist(self, name: str, mbid: str | None = None) -> MBArtist | None:
+        """The MusicBrainz artist for a name, or None rather than a confident wrong guess.
+
+        Last.fm's mbid is tried first when there is one, since it is exact; if
+        it is unknown to MusicBrainz the name search decides. A search hit only
+        counts if it is near-certain and its name or an alias matches.
+        """
+        if mbid:
+            try:
+                return await self.get_artist(mbid)
+            except MusicBrainzError as e:
+                logging.info(f"MusicBrainz lookup of Last.fm's mbid {mbid} failed, searching: {e}")
+        wanted = _name_key(name)
+        for artist in await self.search_artists(name):
+            if (artist.score or 0) < MUSICBRAINZ_MIN_SCORE:
+                break
+            keys = [_name_key(n) for n in (artist.name, *artist.aliases)]
+            if any(k == wanted or fuzz.ratio(k, wanted) >= 95 for k in keys):
+                return artist
+        return None
+
+
+def _name_key(name: str) -> str:
+    """A name with case and punctuation gone, so "Guns N’ Roses" is "Guns N' Roses"."""
+    return re.sub(r"[\W_]+", "", name.casefold())
+
+
+async def artist_catalogue(
+    name: str, mbid: str | None = None, types: Sequence[str] = ("album", "ep")
+) -> tuple[MBArtist, list[MBReleaseGroup]] | None:
+    """An artist's release groups from MusicBrainz, or None if the artist is not found.
+
+    Raises MusicBrainzError or aiohttp.ClientError when MusicBrainz is down;
+    callers that only want this as a bonus should catch both.
+    """
+    async with MusicBrainzClient() as mb:
+        artist = await mb.find_artist(name, mbid)
+        if artist is None:
+            return None
+        return artist, await mb.get_release_groups(artist.mbid, types)

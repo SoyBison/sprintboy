@@ -23,6 +23,7 @@ from bot.tools import (
     lastfm_browse_tag,
     lastfm_resolve,
     lastfm_similar_artists,
+    musicbrainz_discography,
     search_for_torrent,
 )
 
@@ -46,6 +47,7 @@ For music:
     1. Find real candidates with Last.fm. Never rely on your own memory of discographies,
        album titles or similar artists: it is stale and you will invent releases.
        - lastfm_artist_albums for real releases (pass several artists in one call)
+       - musicbrainz_discography for a discography: studio albums only, with years
        - lastfm_similar_artists and lastfm_browse_tag for recommendations and styles
        - lastfm_artist_info to learn what an artist sounds like and which tags to follow
        - lastfm_resolve to turn a vague or misspelled name into the real release name
@@ -108,6 +110,7 @@ AGENT_TOOLS = [
     lastfm_artist_albums,
     lastfm_browse_tag,
     lastfm_resolve,
+    musicbrainz_discography,
 ]
 
 MUSIC_READ = [
@@ -116,6 +119,7 @@ MUSIC_READ = [
     lastfm_artist_albums,
     lastfm_browse_tag,
     lastfm_resolve,
+    musicbrainz_discography,
     check_albums,
     check_for_album,
 ]

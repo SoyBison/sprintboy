@@ -24,7 +24,7 @@ from bot.agent import AgentResult, Step
 from bot.decide import decide
 from bot.llm import Message, assistant
 from bot.orpheus import AccountStats, OrpheusClient, OrpheusError, plan_purchase
-from bot.netcode import BTCategory, LastFMClient, QBittorrentClient
+from bot.netcode import BTCategory, LastFMClient, MBReleaseGroup, QBittorrentClient
 from bot.config import Config
 from bot.questions import (
     ACCOUNT_NAME,
@@ -50,6 +50,7 @@ from bot.tools import (
     _canonicalise,
     _library_lookup,
     _maybe_title,
+    _musicbrainz_catalogue,
     _ownership,
     _same_release,
     _title_matches,
@@ -195,6 +196,80 @@ def _unique_titles(titles: list[str]) -> list[str]:
     return list({_norm(t): t for t in reversed(titles)}.values())[::-1]
 
 
+_TRAILING_QUALIFIER = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
+MAX_UNAVAILABLE_LISTED = 10
+
+
+async def _none() -> None:
+    return None
+
+
+def _unique_kinds(dropped: list[tuple[Release, str]]) -> list[tuple[str, str]]:
+    return list({_norm(r.title): (r.title, kind) for r, kind in reversed(dropped)}.values())[::-1]
+
+
+def _title_keys(title: str) -> set[str]:
+    """Normalised forms of a title: as is, and without a trailing "(...)" qualifier.
+
+    MusicBrainz files "Hasta El Cielo (Con Todo El Mundo in Dub)" where the
+    tracker has "Hasta el Cielo", and only the bare form matches both.
+    """
+    keys = {_norm(title), _norm(_TRAILING_QUALIFIER.sub("", title))}
+    return {k for k in keys if k}
+
+
+def _drop_non_studio(
+    wanted: list[Release], groups: list[MBReleaseGroup] | None
+) -> tuple[list[Release], list[tuple[Release, str]]]:
+    """Split tracker "Album"s into studio albums and the ones MusicBrainz says are not.
+
+    Uploaders tag live sets, remix albums and compilations as [Album], which
+    the albums scope then grabs. A release is only dropped when its title
+    matches a non-studio group and no studio album at all, so an unknown
+    title or a studio album that shares its name with a live one is kept.
+    """
+    if not groups:
+        return wanted, []
+    studio: set[str] = set()
+    other: dict[str, str] = {}
+    for g in groups:
+        keys = _title_keys(g.title)
+        if g.studio:
+            studio |= keys
+        else:
+            for key in keys:
+                other.setdefault(key, g.kind)
+    kept: list[Release] = []
+    dropped: list[tuple[Release, str]] = []
+    for r in wanted:
+        keys = _title_keys(r.title)
+        kind = next((other[k] for k in keys if k in other), None)
+        if kind and not keys & studio:
+            dropped.append((r, kind))
+        else:
+            kept.append(r)
+    return kept, dropped
+
+
+def _not_on_tracker(
+    groups: list[MBReleaseGroup] | None, ranked: list[Release], names: set[str], owned: list[str]
+) -> list[MBReleaseGroup]:
+    """Studio albums MusicBrainz knows about that the search found no torrent for and they lack."""
+    if not groups:
+        return []
+    on_tracker: set[str] = set()
+    for r in ranked:
+        if r.artist.casefold() in names:
+            on_tracker |= _title_keys(r.title)
+    return [
+        g
+        for g in groups
+        if g.studio
+        and not _title_keys(g.title) & on_tracker
+        and _ownership(owned, g.title) == ""
+    ]
+
+
 async def discography(
     text: str, context: TorrentContext, run_id: str | None = None, max_add: int = 20
 ) -> WorkflowResult | None:
@@ -246,19 +321,33 @@ async def discography(
     names = {c.casefold() for c in candidates} | {artist.casefold()}
     record("canonicalise", started, {"artist": span}, f"{artist} {candidates}")
 
-    # c. One tracker search.
+    # c. One tracker search, and MusicBrainz's catalogue alongside it.
     started = time.perf_counter()
     media = _media_from(text)
     async with QBittorrentClient() as qclient:
-        response = await qclient.search(artist, BTCategory.Music)
+        response, groups = await asyncio.gather(
+            qclient.search(artist, BTCategory.Music),
+            _musicbrainz_catalogue(artist, release.artist_mbid)
+            if scope == "albums"
+            else _none(),
+        )
     found = [r for r in (response.results or []) if "FLAC" in r.fileName]
     for result in found:
         context.search_results[result.fileName] = result
     ranked = best_versions([r.fileName for r in found], media)
     record("search", started, {"query": artist}, f"{len(found)} FLAC results")
+    if scope == "albums":
+        record(
+            "musicbrainz", started, {"artist": artist, "mbid": release.artist_mbid},
+            "unavailable" if groups is None
+            else f"{sum(g.studio for g in groups)} studio albums of {len(groups)} groups",
+        )
 
     # d. What the scope asks for.
     wanted = _wanted(ranked, names, scope, artist, media)
+    not_studio: list[tuple[Release, str]] = []
+    if scope == "albums":
+        wanted, not_studio = _drop_non_studio(wanted, groups)
     if not wanted:
         return None
 
@@ -354,6 +443,20 @@ async def discography(
         parts.append("Skipped because you may already have them: " + ", ".join(skipped))
     if later:
         parts.append(f"{len(later)} more not added yet; ask again to get them.")
+    if not_studio:
+        parts.append(
+            "Left out because they aren't studio albums: "
+            + ", ".join(f"{t} ({kind.lower()})" for t, kind in _unique_kinds(not_studio))
+        )
+    unavailable = _not_on_tracker(groups, ranked, names, owned_list)
+    if unavailable:
+        shown = unavailable[:MAX_UNAVAILABLE_LISTED]
+        line = "No torrent found for: " + ", ".join(
+            f"{g.title} ({g.year})" if g.year else g.title for g in shown
+        )
+        if len(unavailable) > len(shown):
+            line += f" and {len(unavailable) - len(shown)} more"
+        parts.append(line)
     if not to_add and not failed:
         what = "the newest release" if scope == "newest" else f"every {_SCOPE_SINGULAR[scope]}"
         if skipped:
