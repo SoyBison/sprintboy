@@ -117,13 +117,17 @@ class Config:
     # SHADOW is asked the same thing in the background and only logged, which
     # is what builds the comparison and distillation data. "off" disables one.
     DECISION_PRIMARY = os.getenv("DECISION_PRIMARY", "jev").strip().lower()
-    DECISION_SHADOW = os.getenv("DECISION_SHADOW", "laya").strip().lower()
+    DECISION_SHADOW = os.getenv("DECISION_SHADOW", "djlaya").strip().lower()
     TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "")
     TYPESAFE_URL = os.getenv("TYPESAFE_URL", "https://api.typesafe.ai")
     TYPESAFE_MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
     OLLAYA_URL = os.getenv("OLLAYA_URL", "")
     OLLAYA_API_KEY = os.getenv("OLLAYA_API_KEY", "")
     OLLAYA_DECISION_MODEL = os.getenv("OLLAYA_DECISION_MODEL", "laya")
+    # Laya fine-tuned on Jev's answers (evals/distill), pulled into ollaya from
+    # the self-hosted registry. Use DECISION_SHADOW=djlaya to log it next to
+    # Jev and fall back to it when Jev is down.
+    DJLAYA_MODEL = os.getenv("DJLAYA_MODEL", "djlaya")
     # One JSON line per decision: state, questions, every backend's answers and
     # latency. /app/data is the mounted volume in the container.
     DECISION_LOG_PATH = os.getenv("DECISION_LOG_PATH", "data/decisions.jsonl")

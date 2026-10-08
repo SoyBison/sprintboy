@@ -45,7 +45,7 @@ ollama-logs:
 
 # Push the decision-model server's compose file to unraid and (re)start it
 ollaya-deploy:
-    tailscale ssh root@shiitake "mkdir -p /mnt/user/appdata/ollaya /mnt/mycelium/appdata/ollaya && chown 1000:1000 /mnt/mycelium/appdata/ollaya"
+    tailscale ssh root@shiitake "mkdir -p /mnt/user/appdata/ollaya /mnt/mycelium/appdata/ollaya /mnt/mycelium/appdata/ollaya-registry/v2 && chown 1000:1000 /mnt/mycelium/appdata/ollaya"
     cat docker-compose.ollaya.yml | tailscale ssh root@shiitake "cat > /mnt/user/appdata/ollaya/docker-compose.yml"
     echo "OLLAYA_API_KEY=$OLLAYA_API_KEY" | tailscale ssh root@shiitake "umask 077 && cat > /mnt/user/appdata/ollaya/.env"
     tailscale ssh root@shiitake "cd /mnt/user/appdata/ollaya && docker compose pull && docker compose up -d"
@@ -113,3 +113,30 @@ shell:
 # Check bot status on Unraid
 status:
     tailscale ssh root@shiitake "docker ps | grep sprintboy"
+
+# --- DJ Laya: distil Jev into a local Laya (evals/distill) ---------------------
+# 1. Messages from the local LLM and album pairs from the library (free)
+distill-data BATCHES="230":
+    uv run python evals/distill/gen_messages.py --batches {{BATCHES}} --out data/distill/messages.jsonl
+    uv run python evals/distill/gen_pairs.py --out data/distill/pairs.jsonl
+
+# 2. Jev labels (about $0.15 for ~6.5k rows; cached, so re-runs are free) and the train/eval split
+distill-label:
+    uv run python evals/distill/label.py route data/distill/messages.jsonl data/distill/route.jsonl
+    uv run python evals/distill/label.py same_release data/distill/pairs.jsonl data/distill/same_release.jsonl
+    uv run python evals/distill/prepare.py
+
+# 3. Train on the 3090. Stops ollama for the ~20 minutes it takes, then restarts it.
+distill-train VERSION="v1":
+    cat evals/distill/docker/Dockerfile | tailscale ssh root@shiitake "mkdir -p /mnt/user/appdata/djlaya-build && cat > /mnt/user/appdata/djlaya-build/Dockerfile"
+    tailscale ssh root@shiitake "cd /mnt/user/appdata/djlaya-build && docker build -q -t djlaya-train ."
+    cat data/distill/train.jsonl | tailscale ssh root@shiitake "cat > /mnt/mycelium/appdata/djlaya/train.jsonl"
+    cat data/distill/eval.jsonl | tailscale ssh root@shiitake "cat > /mnt/mycelium/appdata/djlaya/eval.jsonl"
+    tailscale ssh root@shiitake "docker stop ollama; docker run --rm --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all --shm-size 8g -v /mnt/mycelium/appdata/djlaya:/work djlaya-train laya-train --data /work/train.jsonl --eval /work/eval.jsonl --base english --out /work/djlaya-{{VERSION}} --loss soft-ce --shuffle-options --epochs 4 --micro-batch 8 --grad-accum 8 --device cuda; docker start ollama"
+
+# 4. Publish to the self-hosted registry and (re)pull it into ollaya as `djlaya`
+distill-publish VERSION="v1":
+    cat evals/distill/publish.py | tailscale ssh root@shiitake "cat > /mnt/mycelium/appdata/djlaya/publish.py"
+    tailscale ssh root@shiitake "docker run --rm -v /mnt/mycelium/appdata/djlaya:/work -v /mnt/mycelium/appdata/ollaya:/ollaya:ro -v /mnt/mycelium/appdata/ollaya-registry:/registry djlaya-train python /work/publish.py /work/djlaya-{{VERSION}} djlaya {{VERSION}}"
+    tailscale ssh root@shiitake "docker exec ollaya ollaya pull http://registry/library/djlaya:latest && docker exec ollaya ollaya cp http://registry/library/djlaya:latest djlaya && docker exec ollaya ollaya stop djlaya"
+    uv run python evals/decision_eval.py jev djlaya

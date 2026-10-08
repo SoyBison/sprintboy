@@ -1,0 +1,14 @@
+{
+ "model": "djlaya:latest",
+ "answers": {
+  "same_release": {
+   "type": "noul",
+   "noul": 0.9186
+  }
+ },
+ "usage": {
+  "input_tokens": 126,
+  "output_tokens": 0
+ },
+ "_latency": 0.17520168400369585
+}

@@ -1,0 +1,33 @@
+{
+ "model": "djlaya:latest",
+ "answers": {
+  "domain": {
+   "type": "choice",
+   "choice": "music",
+   "confidence": 0.8607,
+   "probabilities": {
+    "music": 0.8886,
+    "movie": 0.0193,
+    "tv": 0.0058,
+    "tracker": 0.0201,
+    "chat": 0.0661
+   }
+  },
+  "kind": {
+   "type": "choice",
+   "choice": "open_ended",
+   "confidence": 0.7765,
+   "probabilities": {
+    "specific": 0.1453,
+    "discography": 0.0167,
+    "open_ended": 0.8324,
+    "question": 0.0055
+   }
+  }
+ },
+ "usage": {
+  "input_tokens": 386,
+  "output_tokens": 0
+ },
+ "_latency": 0.6975253480050014
+}

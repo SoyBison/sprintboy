@@ -1,0 +1,33 @@
+{
+ "model": "laya:en",
+ "answers": {
+  "domain": {
+   "type": "choice",
+   "choice": "tv",
+   "confidence": 0.7878,
+   "probabilities": {
+    "music": 0.0236,
+    "movie": 0.0238,
+    "tv": 0.8302,
+    "tracker": 0.0348,
+    "chat": 0.0877
+   }
+  },
+  "kind": {
+   "type": "choice",
+   "choice": "question",
+   "confidence": 0.1138,
+   "probabilities": {
+    "specific": 0.2016,
+    "discography": 0.2816,
+    "open_ended": 0.1814,
+    "question": 0.3354
+   }
+  }
+ },
+ "usage": {
+  "input_tokens": 376,
+  "output_tokens": 0
+ },
+ "_latency": 0.49563226600002963
+}

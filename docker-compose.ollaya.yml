@@ -31,3 +31,18 @@ services:
     ports:
       - '11435:11435'
     restart: unless-stopped
+
+  # A self-hosted model registry for decision models we train ourselves (DJ
+  # Laya), so ollaya can pull and serve them like its stock models. ollaya's
+  # registry protocol is static files: /v2/<ns>/<model>/manifests/<tag> and
+  # /v2/<ns>/<model>/blobs/<digest>, written by evals/distill/publish.py.
+  # Pull with: ollaya pull http://registry/library/djlaya:latest
+  registry:
+    image: nginx:alpine
+    container_name: ollaya-registry
+    volumes:
+      - /mnt/mycelium/appdata/ollaya-registry:/usr/share/nginx/html:ro
+    ports:
+      - '11437:80'
+    restart: unless-stopped
+

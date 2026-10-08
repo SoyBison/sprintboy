@@ -188,3 +188,29 @@ def test_route_state_keeps_the_last_few_turns_clipped():
     assert [t["text"] for t in route_state("m", many)["earlier"]] == [
         str(i) for i in range(10 - EARLIER_TURNS, 10)
     ]
+
+
+@pytest.mark.asyncio
+async def test_djlaya_answers_when_jev_fails_on_a_distilled_set(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from bot import decide as d
+    from bot.config import Config
+
+    monkeypatch.setattr(Config, "DECISION_PRIMARY", "jev")
+    monkeypatch.setattr(Config, "DECISION_SHADOW", "djlaya")
+    monkeypatch.setattr(Config, "TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(Config, "OLLAYA_URL", "http://ollaya")
+    monkeypatch.setattr(Config, "DECISION_LOG_PATH", "/dev/null")
+    local = d.Decision("djlaya", "djlaya", {"q": {"type": "noul", "noul": 0.7}}, 0.3)
+
+    async def ask(backend, state, questions):
+        if backend.name == "jev":
+            raise d.DecisionError("jev 401: nope")
+        return local
+
+    monkeypatch.setattr(d, "_ask", ask)
+    q = {"q": {"type": "noul", "instructions": "?"}}
+    assert await d.decide("route/v3", {"message": "hi"}, q) is local
+    # Not distilled: no fallback, the caller handles None as before.
+    assert await d.decide("specific_pick/v3", {"message": "hi"}, q) is None

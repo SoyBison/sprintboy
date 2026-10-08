@@ -48,7 +48,17 @@ def _backend(name: str) -> Backend | None:
         if not Config.OLLAYA_URL:
             return None
         return Backend("laya", Config.OLLAYA_URL, Config.OLLAYA_API_KEY, Config.OLLAYA_DECISION_MODEL, 20.0)
+    if name == "djlaya":
+        if not Config.OLLAYA_URL:
+            return None
+        return Backend("djlaya", Config.OLLAYA_URL, Config.OLLAYA_API_KEY, Config.DJLAYA_MODEL, 20.0)
     return None
+
+
+# Question sets DJ Laya was distilled on (evals/distill). When Jev fails on one
+# of these, the shadow's answer is good enough to act on: 32/35 domain and
+# 8/8 follow-ups on the hand-labelled eval, against Jev's 30/35 and 8/8.
+DISTILLED = {"route/v3", "same_release/v1"}
 
 
 class DecisionError(Exception):
@@ -176,6 +186,26 @@ async def decide(
             result = e
     entry["primary"] = primary.name if primary else None
     entry[primary.name if primary else "primary"] = _summary(result)
+
+    if (
+        not isinstance(result, Decision)
+        and shadow_task is not None
+        and shadow is not None
+        and shadow.name == "djlaya"
+        and name in DISTILLED
+    ):
+        # Self-hosted fallback: wait for the shadow and use it.
+        try:
+            fallback: Decision | BaseException = await shadow_task
+        except BaseException as e:  # noqa: BLE001
+            fallback = e
+        entry[shadow.name] = _summary(fallback)
+        entry["fallback"] = shadow.name
+        _record(entry)
+        if isinstance(fallback, Decision):
+            logger.info(f"Decision {name}: {primary.name if primary else 'primary'} failed, used {shadow.name}")
+            return fallback
+        return None
 
     if shadow_task is None:
         _record(entry)

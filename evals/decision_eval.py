@@ -29,6 +29,8 @@ CACHE = Path(__file__).parent / "cache"
 BACKENDS = {
     "jev": ("https://api.typesafe.ai", "TYPESAFE_API_KEY", "jev-latest"),
     "laya": (os.getenv("OLLAYA_URL", "http://100.99.141.127:11435"), "OLLAYA_API_KEY", "laya"),
+    # Laya fine-tuned on Jev's answers (evals/distill), served by the same ollaya.
+    "djlaya": (os.getenv("OLLAYA_URL", "http://100.99.141.127:11435"), "OLLAYA_API_KEY", "djlaya"),
 }
 
 # ---------------------------------------------------------------------------
@@ -243,7 +245,7 @@ def report(name: str, routes, followups, releases):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("backends", nargs="*", default=["laya", "jev"])
+    parser.add_argument("backends", nargs="*", default=["laya", "djlaya", "jev"])
     parser.add_argument("--refresh", action="store_true", help="ignore the cache")
     args = parser.parse_args()
     for backend in args.backends:
