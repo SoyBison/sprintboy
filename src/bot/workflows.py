@@ -16,19 +16,24 @@ import string
 import time
 from dataclasses import dataclass, field
 from itertools import zip_longest
+from typing import Awaitable, Callable
 
 from thefuzz import fuzz
 
 from bot.agent import AgentResult, Step
 from bot.decide import decide
 from bot.llm import Message, assistant
+from bot.orpheus import AccountStats, OrpheusClient, OrpheusError, plan_purchase
 from bot.netcode import BTCategory, LastFMClient, QBittorrentClient
+from bot.config import Config
 from bot.questions import (
+    ACCOUNT_NAME,
     DISCOGRAPHY_QUESTIONS_NAME,
     RECOMMEND_FIT_NAME,
     RECOMMEND_SEED_NAME,
     SPECIFIC_EXTRACT_NAME,
     SPECIFIC_PICK_NAME,
+    account_questions,
     discography_questions,
     recommend_fit_questions,
     recommend_seed_questions,
@@ -111,10 +116,19 @@ class Pending:
 
 
 @dataclass
+class Confirmation:
+    """Something that costs money: only run `action` after the owner presses Confirm."""
+
+    prompt: str
+    action: Callable[[], Awaitable[str]]
+
+
+@dataclass
 class WorkflowResult:
     reply: str
     steps: list[Step]
     pending: list[Pending] = field(default_factory=list)
+    confirm: Confirmation | None = None
 
     def to_agent_result(self, messages: list[Message]) -> AgentResult:
         return AgentResult(
@@ -122,6 +136,7 @@ class WorkflowResult:
             steps=self.steps,
             stopped="workflow",
             pending=self.pending,
+            confirm=self.confirm,
         )
 
 
@@ -1210,3 +1225,142 @@ async def specific(
     parts.extend(f'Couldn\'t find anything called "{span}".' for span in missing)
     parts.extend(f'Did you mean one of these for "{p.wanted}"?' for p in pending)
     return WorkflowResult(reply="\n".join(parts), steps=steps, pending=pending)
+
+
+# --- Orpheus account ---------------------------------------------------------
+
+MIN_MAX_CONFIDENCE = 0.6
+_TOKEN_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "a couple": 2, "couple": 2, "a few": 3, "few": 3,
+}
+_TOKEN_COUNT = re.compile(
+    r"\b(\d{1,3}|" + "|".join(sorted((re.escape(w) for w in _TOKEN_WORDS), key=len, reverse=True))
+    + r")\s+(?:of\s+)?(?:free\s*-?\s*leech\s+)?(?:tokens?|fl)\b",
+    re.IGNORECASE,
+)
+SHOP_URL = "https://orpheus.network/bonus.php"
+
+
+def _tokens(n: int) -> str:
+    return f"{n} freeleech token" + ("" if n == 1 else "s")
+
+
+def token_count(text: str) -> int | None:
+    """The number of tokens the message names, if it does."""
+    match = _TOKEN_COUNT.search(text)
+    if not match:
+        return None
+    word = match.group(1).lower()
+    return int(word) if word.isdigit() else _TOKEN_WORDS[word]
+
+
+def status_reply(stats: AccountStats) -> str:
+    per_day = round(stats.bonus_per_hour * 24)
+    text = (
+        f"You have {_tokens(stats.tokens)} and {stats.bonus_points:,} bonus points "
+        f"(+{stats.bonus_per_hour:.0f}/hour, about {per_day:,}/day). "
+        f"Ratio {stats.ratio:.2f} (you need {stats.required_ratio:.2f})."
+    )
+    if stats.ratio < stats.required_ratio + 0.05:
+        text += "\n⚠️ That's close to ratio watch: use tokens on big downloads."
+    return text
+
+
+def _orpheus_failure(e: Exception) -> str:
+    message = str(e)
+    prefix = "Couldn't reach Orpheus: "
+    return message if message.startswith(prefix) else prefix + message
+
+
+async def account(text: str, *, run_id: str | None = None) -> WorkflowResult | None:
+    """Answer an Orpheus account question, or offer a token purchase to confirm."""
+    started = time.perf_counter()
+    decision = await decide(ACCOUNT_NAME, {"message": text}, account_questions(), run_id=run_id)
+    if decision is not None:
+        intent, _ = decision.choice("intent")
+        wants_max = decision.noul("max") >= MIN_MAX_CONFIDENCE
+    else:
+        intent = "buy" if "buy" in text.lower() else "status"
+        wants_max = "as many" in text.lower()
+    count = token_count(text)
+    if count is None and not wants_max:
+        count = 1
+
+    def done(reply: str, confirm: Confirmation | None = None) -> WorkflowResult:
+        step = Step(
+            "tool",
+            "account",
+            time.perf_counter() - started,
+            args={"intent": intent, "count": count},
+            result=reply,
+        )
+        return WorkflowResult(reply=reply, steps=[step], confirm=confirm)
+
+    try:
+        async with OrpheusClient() as client:
+            stats, authkey = await client.account()
+            status = status_reply(stats)
+            if intent != "buy":
+                return done(status)
+            if not Config.ORPHEUS_SESSION_COOKIE:
+                return done(
+                    f"{status}\n\nI can't buy from here without your Orpheus session cookie "
+                    f"(ORPHEUS_SESSION_COOKIE). You can buy them at {SHOP_URL}"
+                )
+            items = await client.token_shop()
+    except OrpheusError as e:
+        return done(_orpheus_failure(e))
+
+    plan = plan_purchase(items, count, stats.bonus_points)
+    if not plan:
+        cheapest = plan_purchase(items, count, 10**12)
+        if count is None:
+            priced = [i for i in items if i.tokens > 0]
+            if not priced:
+                return done(f"{status}\n\nThe shop has no freeleech tokens on sale right now.")
+            item = min(priced, key=lambda i: i.price)
+            return done(
+                f"{status}\n\nYou can't afford any tokens yet: the cheapest is "
+                f"{item.price:,} points for {item.tokens}."
+            )
+        if not cheapest:
+            return done(
+                f"{status}\n\nThe shop can't make up exactly {_tokens(count)} right now."
+            )
+        price = sum(i.price for i in cheapest)
+        return done(
+            f"{status}\n\nYou can't afford {_tokens(count)}: the cheapest is "
+            f"{price:,} points for {count}."
+        )
+
+    total_tokens = sum(i.tokens for i in plan)
+    total_price = sum(i.price for i in plan)
+    left = stats.bonus_points - total_price
+    prompt = (
+        f"Buy {_tokens(total_tokens)} for {total_price:,} bonus points? "
+        f"You'd have {left:,} left."
+    )
+
+    async def action() -> str:
+        bought = 0
+        try:
+            async with OrpheusClient() as buyer:
+                for item in plan:
+                    await buyer.buy(item.label, authkey)
+                    bought += item.tokens
+        except OrpheusError as e:
+            if bought == 0:
+                return _orpheus_failure(e)
+            return f"Bought {bought} of {total_tokens} before Orpheus said: {e}"
+        try:
+            async with OrpheusClient() as reader:
+                after, _ = await reader.account()
+        except OrpheusError:
+            return f"Bought {bought} token{'' if bought == 1 else 's'}."
+        return (
+            f"Bought {bought} token{'' if bought == 1 else 's'}. You now have "
+            f"{after.tokens} tokens and {after.bonus_points:,} bonus points."
+        )
+
+    return done(f"{status}\n\n{prompt}", Confirmation(prompt=prompt, action=action))

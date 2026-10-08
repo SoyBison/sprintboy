@@ -14,7 +14,7 @@ from bot.netcode import (
 from bot.tools import AlbumRef, TorrentContext, download_many
 from bot import aotm, turn, workflows
 from bot.agent import AgentResult
-from bot.choices import DidYouMeanView
+from bot.choices import ConfirmView, DidYouMeanView
 from bot.workflows import Choice, Pending, describe_lines
 from bot.llm import OllamaChat
 from bot.runlog import record_run
@@ -354,6 +354,12 @@ async def hand_to_agent(
     )
 
 
+async def is_owner(user: discord.abc.User) -> bool:
+    if Config.DISCORD_OWNER_ID:
+        return user.id == int(Config.DISCORD_OWNER_ID)
+    return await bot.is_owner(user)
+
+
 async def run_and_reply(
     target: discord.Message,
     author: discord.abc.User,
@@ -370,6 +376,15 @@ async def run_and_reply(
     async with target.channel.typing():
         try:
             t = await turn.prepare(history)
+            if (
+                t.route is not None
+                # No trust check: turn.run sends any tracker route to the
+                # account workflow, so the owner check must cover the same set.
+                and t.route.domain == "tracker"
+                and not await is_owner(author)
+            ):
+                await reply_in_chunks(target, "Only the owner can see the tracker account.")
+                return
             logger.info(
                 f"Handling message {target.id} in conversation {root_id} run {t.run_id}"
             )
@@ -401,6 +416,12 @@ async def run_and_reply(
         note=note,
         seconds=time.perf_counter() - started,
     )
+
+    if result.confirm is not None:
+        view = ConfirmView(result.confirm, author.id)
+        view.message = await last_message.reply(
+            result.confirm.prompt, view=view, mention_author=False
+        )
 
     if result.pending:
         await ask_did_you_mean(

@@ -45,6 +45,8 @@ class AgentResult:
     nudged: bool = False
     # Unresolved "did you mean" questions (workflows.Pending) for the chat to ask.
     pending: list = field(default_factory=list)
+    # A workflows.Confirmation to ask the owner before anything is spent.
+    confirm: object | None = None
 
 
 def _clip(text: str, limit: int) -> str:

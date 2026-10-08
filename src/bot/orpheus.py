@@ -55,6 +55,80 @@ class OrpheusClient:
                 _last_request = time.monotonic()
         return resp, body
 
+    async def _web(
+        self, method: str, path: str, data: dict | None = None
+    ) -> tuple[int, dict, str]:
+        """A rate-limited request to the website (not ajax.php), logged in by cookie.
+
+        Redirects are not followed. Returns (status, headers, body text).
+        """
+        global _last_request
+        if self.session is None:
+            raise RuntimeError("OrpheusClient must be used with `async with`")
+        url = f"{Config.ORPHEUS_URL.rstrip('/')}/{path}"
+        headers = {"Cookie": f"session={Config.ORPHEUS_SESSION_COOKIE}"}
+        async with _rate_lock:
+            wait = _last_request + MIN_REQUEST_GAP - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                resp = await self.session.request(
+                    method, url, data=data, headers=headers, allow_redirects=False
+                )
+                body = (await resp.read()).decode("utf-8", errors="replace")
+            except aiohttp.ClientError as e:
+                raise OrpheusError(f"Couldn't reach Orpheus: {e}") from e
+            finally:
+                _last_request = time.monotonic()
+        return resp.status, dict(resp.headers), body
+
+    async def account(self) -> tuple["AccountStats", str]:
+        """The user's stats, and their authkey (needed to buy; keep it private)."""
+        response = await self._json({"action": "index"})
+        try:
+            stats = response["userstats"]
+            return (
+                AccountStats(
+                    username=str(response["username"]),
+                    uploaded=int(stats["uploaded"]),
+                    downloaded=int(stats["downloaded"]),
+                    ratio=float(stats["ratio"]),
+                    required_ratio=float(stats["requiredratio"]),
+                    bonus_points=int(stats["bonusPoints"]),
+                    bonus_per_hour=float(stats["bonusPointsPerHour"]),
+                    tokens=int(stats["tokens"]),
+                    user_class=str(stats.get("class", "")),
+                ),
+                str(response["authkey"]),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise OrpheusError("Orpheus returned an unexpected account response") from e
+
+    async def token_shop(self) -> list["ShopItem"]:
+        """The freeleech token packs on sale in the bonus shop."""
+        status, headers, body = await self._web("GET", "bonus.php")
+        if 300 <= status < 400 and "login" in headers.get("Location", ""):
+            raise OrpheusError(_SESSION_ERROR)
+        if status in (401, 403):
+            raise OrpheusError(_SESSION_ERROR)
+        if 'name="username"' in body and 'name="password"' in body:
+            raise OrpheusError(_SESSION_ERROR)
+        if status != 200:
+            raise OrpheusError(f"Orpheus bonus shop returned HTTP {status}")
+        return parse_token_shop(body)
+
+    async def buy(self, label: str, authkey: str) -> None:
+        """Buy one shop item. Raises OrpheusError unless Orpheus confirms it."""
+        status, headers, body = await self._web(
+            "POST", "bonus.php", {"auth": authkey, "action": "purchase", "label": label}
+        )
+        if 300 <= status < 400 and "complete=" in headers.get("Location", ""):
+            return
+        if 300 <= status < 400 and "login" in headers.get("Location", ""):
+            raise OrpheusError(_SESSION_ERROR)
+        text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", body)).split())
+        raise OrpheusError(text[:200] or f"HTTP {status}")
+
     @staticmethod
     def _unwrap(data) -> object:
         if not isinstance(data, dict) or data.get("status") != "success":
@@ -91,6 +165,98 @@ class OrpheusClient:
         if resp.status != 200:
             raise OrpheusError(f"Download failed with HTTP {resp.status}")
         return body
+
+
+_SESSION_ERROR = "Orpheus session cookie is missing or expired"
+
+
+@dataclass
+class AccountStats:
+    username: str
+    uploaded: int
+    downloaded: int
+    ratio: float
+    required_ratio: float
+    bonus_points: int
+    bonus_per_hour: float
+    tokens: int
+    user_class: str
+
+
+@dataclass(frozen=True)
+class ShopItem:
+    label: str  # "token-1"
+    title: str  # "1 Freeleech Token"
+    tokens: int
+    price: int
+
+
+_ROW = re.compile(r"<tr\b.*?</tr>", re.S | re.I)
+_LABEL = re.compile(r"""name=["'](token-[\w-]+)["']|item=(token-[\w-]+)""", re.I)
+_PRICE = re.compile(
+    r"""<td[^>]*text-align:\s*right[^>]*>\s*([\d,]+)\s*</td>""", re.S | re.I
+)
+
+
+def parse_token_shop(page: str) -> list[ShopItem]:
+    """Freeleech token rows from the bonus shop page (affordable or not)."""
+    items = []
+    for row in _ROW.findall(page):
+        label = _LABEL.search(row)
+        price = _PRICE.search(row)
+        if not label or not price:
+            continue
+        cells = [
+            " ".join(html.unescape(re.sub(r"<[^>]+>", " ", c)).split())
+            for c in re.findall(r"<td\b.*?</td>", row, re.S | re.I)
+        ]
+        title = next((c for c in cells if re.match(r"\d+\s", c)), "")
+        count = re.match(r"(\d+)", title)
+        if not count:
+            continue
+        items.append(
+            ShopItem(
+                label=(label.group(1) or label.group(2)).lower(),
+                title=title,
+                tokens=int(count.group(1)),
+                price=int(price.group(1).replace(",", "")),
+            )
+        )
+    return items
+
+
+MAX_PLAN_TOKENS = 200
+
+
+def plan_purchase(items: list[ShopItem], count: int | None, budget: int) -> list[ShopItem]:
+    """Cheapest items reaching exactly `count` tokens within budget.
+
+    `count=None` maximises tokens within budget (ties: cheaper). [] if impossible.
+    """
+    usable = [i for i in items if 0 < i.tokens <= MAX_PLAN_TOKENS and i.price >= 0]
+    if not usable or budget < 0:
+        return []
+    top = MAX_PLAN_TOKENS if count is None else count
+    if count is not None and (count < 1 or count > MAX_PLAN_TOKENS):
+        return []
+    # best[n] = (cost, items) for exactly n tokens
+    best: list[tuple[int, list[ShopItem]] | None] = [None] * (top + 1)
+    best[0] = (0, [])
+    for n in range(1, top + 1):
+        for item in usable:
+            prev = n - item.tokens
+            if prev < 0 or best[prev] is None:
+                continue
+            cost = best[prev][0] + item.price
+            if best[n] is None or cost < best[n][0]:
+                best[n] = (cost, [*best[prev][1], item])
+    if count is not None:
+        found = best[count]
+        return found[1] if found and found[0] <= budget else []
+    for n in range(top, 0, -1):
+        if best[n] is not None and best[n][0] <= budget:
+            return best[n][1]
+    return []
 
 
 @dataclass(frozen=True)

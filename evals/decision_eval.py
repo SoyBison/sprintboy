@@ -37,6 +37,11 @@ BACKENDS = {
 
 # (message, domain, kind)
 ROUTE_CASES = [
+    ("how many tokens do I have left?", "tracker", "question"),
+    ("how many bonus points have I got", "tracker", "question"),
+    ("what's my ratio looking like", "tracker", "question"),
+    ("buy 2 freeleech tokens", "tracker", "specific"),
+    ("buy as many tokens as I can with my bonus points", "tracker", "specific"),
     ("throw some new shoegaze at me", "music", "open_ended"),
     ("get me 5 albums similar to Khruangbin", "music", "open_ended"),
     ("I want something chill to work to", "music", "open_ended"),

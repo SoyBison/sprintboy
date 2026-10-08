@@ -65,6 +65,10 @@ class Config:
     # the bot offers.
     ORPHEUS_API_KEY = os.getenv("ORPHEUS_API_KEY", "")
     ORPHEUS_URL = os.getenv("ORPHEUS_URL", "https://orpheus.network")
+    # The raw value of the `session` cookie from a logged-in browser. The API key
+    # cannot reach the bonus shop (bonus.php), so buying tokens needs this. Optional:
+    # without it, account status still works.
+    ORPHEUS_SESSION_COOKIE = os.getenv("ORPHEUS_SESSION_COOKIE", "")
     # Who gets the Album of the Month DM. Empty means the bot application's owner.
     DISCORD_OWNER_ID = os.getenv("DISCORD_OWNER_ID", "")
     # How often to look for a new Album of the Month winner.

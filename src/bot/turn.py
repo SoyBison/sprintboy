@@ -10,7 +10,7 @@ from bot.agent import AgentResult, run_agent
 from bot.decide import current_run_id
 from bot.llm import ChatModel, Message, build_chat_model, from_dict, system, user
 from bot.output import add_nudge
-from bot.routing import Route, route
+from bot.routing import MIN_DOMAIN_CONFIDENCE, Route, route
 from bot.toolkit import Tool
 from bot.tools import (
     add_torrent,
@@ -126,7 +126,7 @@ MUSIC_DOWNLOAD = [download_albums, search_for_torrent, add_torrent]
 
 def select_tools(route: Route | None) -> list:
     """Only the tools the routed request needs; everything if we are unsure."""
-    if route is None or not route.trusted:
+    if route is None or not route.trusted or route.domain == "tracker":
         return AGENT_TOOLS
     if route.kind == "question":
         if route.domain == "music":
@@ -212,6 +212,29 @@ async def run(
     goes straight to the agent.
     """
     decided = turn.route
+    # Kind does not matter for the account workflow: it asks its own question.
+    if (
+        use_workflows
+        and decided
+        and decided.domain == "tracker"
+        and decided.domain_p >= MIN_DOMAIN_CONFIDENCE
+    ):
+        started = time.perf_counter()
+        try:
+            wf = await workflows.account(turn.text, run_id=turn.run_id)
+        except Exception:
+            logger.exception(f"Run {turn.run_id}: account workflow failed")
+            wf = None
+        if wf is not None:
+            if on_event:
+                emitted = on_event("reply", {"content": wf.reply})
+                if inspect.isawaitable(emitted):
+                    await emitted
+            logger.info(
+                f"Run {turn.run_id}: handled by the account workflow "
+                f"in {time.perf_counter() - started:.1f}s"
+            )
+            return wf.to_agent_result(turn.messages)
     if use_workflows and decided and decided.trusted and decided.domain == "music":
         if decided.kind == "specific":
             name = "specific"

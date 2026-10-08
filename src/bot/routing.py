@@ -64,7 +64,7 @@ class Route:
 
     def note(self) -> str:
         """The instruction handed to the agent alongside the conversation."""
-        if not self.trusted:
+        if not self.trusted or self.domain == "tracker":
             return ""
         media = {"music": "music", "movie": "a movie", "tv": "TV"}.get(self.domain, "")
         if self.kind == "open_ended":
@@ -89,6 +89,10 @@ class Route:
             "search for or add torrents."
         )
 
+
+_TRACKER_WORDS = re.compile(
+    r"\b(freeleech|fl tokens?|tokens?|bonus points?|bp|ratio)\b", re.IGNORECASE
+)
 
 # How much of the conversation the router sees: enough to resolve "that" and
 # "it", little enough to stay a ~0.2s call. Bot replies can be long lists.
@@ -131,4 +135,8 @@ async def route(
         return None
     domain, domain_p = decision.choice("domain")
     kind, kind_p = decision.choice("kind")
+    # "how many tokens do I have left?" reads as small talk to the router; in
+    # this bot those words only ever mean the Orpheus account.
+    if domain == "chat" and _TRACKER_WORDS.search(message):
+        domain, domain_p = "tracker", max(domain_p, MIN_DOMAIN_CONFIDENCE)
     return Route(domain, domain_p, kind, kind_p, requested_count(message))

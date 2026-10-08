@@ -1,0 +1,33 @@
+{
+ "model": "jev-1.13.0",
+ "answers": {
+  "domain": {
+   "type": "choice",
+   "choice": "tracker",
+   "confidence": 0.97,
+   "probabilities": {
+    "music": 0.0,
+    "chat": 0.02,
+    "tracker": 0.98,
+    "movie": 0.0,
+    "tv": 0.0
+   }
+  },
+  "kind": {
+   "type": "choice",
+   "choice": "question",
+   "confidence": 1.0,
+   "probabilities": {
+    "open_ended": 0.0,
+    "question": 1.0,
+    "specific": 0.0,
+    "discography": 0.0
+   }
+  }
+ },
+ "usage": {
+  "input_tokens": 646,
+  "output_tokens": 99
+ },
+ "_latency": 0.17940536100650206
+}

@@ -6,7 +6,7 @@ whenever the wording changes, so answers to different wordings are never mixed
 when comparing backends or building training data.
 """
 
-ROUTE_QUESTIONS_NAME = "route/v2"
+ROUTE_QUESTIONS_NAME = "route/v3"
 
 # State: {"message": latest text, "earlier": [{"from": "user"|"bot", "text": ...}]}
 # with `earlier` oldest first and absent for a fresh message. v1 saw only the
@@ -25,6 +25,10 @@ ROUTE_QUESTIONS = {
             "music": "albums, artists, songs, genres of music",
             "movie": "films",
             "tv": "TV shows, seasons or episodes",
+            "tracker": (
+                "their Orpheus tracker account: ratio, bonus points, buying or counting "
+                "freeleech tokens (\"tokens\" on its own means these)"
+            ),
             "chat": "none in particular: thanks, small talk, or a question about the bot itself",
         },
     },
@@ -43,6 +47,27 @@ ROUTE_QUESTIONS = {
         },
     },
 }
+
+ACCOUNT_NAME = "account/v1"
+
+
+def account_questions() -> dict:
+    """What an Orpheus account message wants. State: {"message": text}."""
+    return {
+        "intent": {
+            "type": "choice",
+            "instructions": "What does the message want to do with the user's tracker account?",
+            "criteria": {
+                "status": "asks how many tokens / bonus points / what ratio",
+                "buy": "wants to buy freeleech tokens with bonus points",
+            },
+        },
+        "max": {
+            "type": "noul",
+            "instructions": "Does the message ask to buy as many tokens as possible?",
+        },
+    }
+
 
 SAME_RELEASE_QUESTIONS_NAME = "same_release/v1"
 
