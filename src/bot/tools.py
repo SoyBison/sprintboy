@@ -920,14 +920,10 @@ def _title_matches(wanted: str, found: str) -> bool:
     return fuzz.token_set_ratio(a, b) >= 90
 
 
-@tool(args_schema=DownloadAlbumsQuery)
-async def download_albums(
-    albums: list[AlbumRef],
-    runtime: Runtime,
-    media: str | None = None,
-) -> str:
-    """Get albums in one step: checks the library, searches, picks the best version (SACD and perfect CD rips first, never vinyl unless asked; set media only when the user asks for CD, SACD, WEB or Vinyl) and adds it. Pass every album you chose in one call, using Last.fm spellings. Only items reported as 'Added' are downloading."""
-    context = runtime.context
+async def download_many(
+    albums: list[AlbumRef], context: TorrentContext, media: str | None = None
+) -> list[str]:
+    """Check, search and add each album; one result line per album, in input order."""
     context.torrent_types.add(BTCategory.Music)
     refs = [AlbumRef.model_validate(a) if isinstance(a, dict) else a for a in albums]
     semaphore = asyncio.Semaphore(3)
@@ -990,4 +986,14 @@ async def download_albums(
             logging.warning(f"download_albums for {ref} failed: {outcome}")
             outcome = f"NOT ADDED: '{ref.artist} - {ref.title}' failed: {outcome}"
         lines.append(outcome)
-    return "\n".join(lines)
+    return lines
+
+
+@tool(args_schema=DownloadAlbumsQuery)
+async def download_albums(
+    albums: list[AlbumRef],
+    runtime: Runtime,
+    media: str | None = None,
+) -> str:
+    """Get albums in one step: checks the library, searches, picks the best version (SACD and perfect CD rips first, never vinyl unless asked; set media only when the user asks for CD, SACD, WEB or Vinyl) and adds it. Pass every album you chose in one call, using Last.fm spellings. Only items reported as 'Added' are downloading."""
+    return "\n".join(await download_many(albums, runtime.context, media))

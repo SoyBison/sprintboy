@@ -2,7 +2,7 @@ import inspect
 import logging
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from bot import workflows
@@ -175,6 +175,7 @@ class Turn:
     route: Route | None
     run_id: str
     text: str = ""
+    earlier: list[dict] = field(default_factory=list)
 
 
 async def prepare(history: list[dict]) -> Turn:
@@ -197,6 +198,7 @@ async def prepare(history: list[dict]) -> Turn:
         route=decided,
         run_id=run_id,
         text=text,
+        earlier=_earlier(history),
     )
 
 
@@ -207,28 +209,44 @@ async def run(turn: Turn, context, on_event: Callable | None = None) -> AgentRes
     cannot handle the message, and the agent takes over.
     """
     decided = turn.route
-    if (
-        decided
-        and decided.trusted
-        and decided.domain == "music"
-        and decided.kind == "discography"
-    ):
-        started = time.perf_counter()
-        try:
-            wf = await workflows.discography(turn.text, context, run_id=turn.run_id)
-        except Exception:
-            logger.exception(f"Run {turn.run_id}: discography workflow failed")
-            wf = None
-        if wf is not None:
-            if on_event:
-                emitted = on_event("reply", {"content": wf.reply})
-                if inspect.isawaitable(emitted):
-                    await emitted
-            logger.info(
-                f"Run {turn.run_id}: handled by the discography workflow "
-                f"in {time.perf_counter() - started:.1f}s"
-            )
-            return wf.to_agent_result(turn.messages)
+    if decided and decided.trusted and decided.domain == "music":
+        if decided.kind == "discography":
+            name = "discography"
+
+            def start():
+                return workflows.discography(turn.text, context, run_id=turn.run_id)
+
+        elif decided.kind == "open_ended":
+            name = "recommend"
+
+            def start():
+                return workflows.recommend(
+                    turn.text,
+                    context,
+                    count=decided.count or 3,
+                    earlier=turn.earlier,
+                    run_id=turn.run_id,
+                )
+
+        else:
+            start = None
+        if start is not None:
+            started = time.perf_counter()
+            try:
+                wf = await start()
+            except Exception:
+                logger.exception(f"Run {turn.run_id}: {name} workflow failed")
+                wf = None
+            if wf is not None:
+                if on_event:
+                    emitted = on_event("reply", {"content": wf.reply})
+                    if inspect.isawaitable(emitted):
+                        await emitted
+                logger.info(
+                    f"Run {turn.run_id}: handled by the {name} workflow "
+                    f"in {time.perf_counter() - started:.1f}s"
+                )
+                return wf.to_agent_result(turn.messages)
     known = set(context.internal_torrents)
     model = get_model()
     result = await run_agent(

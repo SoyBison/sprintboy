@@ -86,3 +86,61 @@ def discography_questions(spans: list[str]) -> dict:
             },
         },
     }
+
+RECOMMEND_SEED_NAME = "recommend_seed/v1"
+
+
+def recommend_seed_questions(options: list[str]) -> dict:
+    """What an open-ended request is based on: an artist, an album or a tag, and its preferences."""
+    return {
+        "seed": {
+            "type": "choice",
+            "instructions": (
+                "Which of these is what the recommendations should be based on: an artist, "
+                "an album, or a genre, style or mood? Judge `message`; use `earlier` only to "
+                "resolve words like 'that' or 'more like it'."
+            ),
+            "criteria": {option: None for option in options}
+            | {"none": "none of these is something to base recommendations on"},
+        },
+        "seed_type": {
+            "type": "choice",
+            "instructions": "What kind of thing is the recommendation based on?",
+            "criteria": {
+                "artist": "a musician or band",
+                "album": "a particular album",
+                "tag": "a genre, style, scene, era or mood",
+                "none": "nothing to base it on ('surprise me')",
+            },
+        },
+        "same_artist": {
+            "type": "noul",
+            "instructions": "Does the message want more releases by that same artist, rather than other artists?",
+        },
+        "new_to_them": {
+            "type": "noul",
+            "instructions": "Does the message want artists the user does not already listen to?",
+            "criteria": {
+                "true": "new, discover, introduce, haven't heard",
+                "false": "no preference",
+            },
+        },
+    }
+
+
+RECOMMEND_FIT_NAME = "recommend_fit/v1"
+
+
+def recommend_fit_questions(keys: list[str]) -> dict:
+    """How well each candidate album fits the request."""
+    return {
+        key: {
+            "type": "score",
+            "instructions": (
+                f"How well does `candidates.{key}` fit what `request` asks for, including any "
+                f"qualifiers such as heavier, older, from a decade, or a mood?"
+            ),
+            "criteria": ["does not fit", "loosely fits", "fits", "fits very well"],
+        }
+        for key in keys
+    }

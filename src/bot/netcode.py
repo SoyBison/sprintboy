@@ -929,6 +929,27 @@ class LastFMClient(AsyncAPIClient):
             _lastfm_dict(body.get("albums") or body.get("topalbums"))
         )
 
+    async def get_top_tags(self, limit: int = 500) -> list[tuple[str, int]]:
+        """Last.fm's most used tags as (name, reach), most reached first."""
+        body = await self._get("chart.getTopTags", limit=limit)
+        tags = []
+        for raw in _lastfm_list(_lastfm_dict(body.get("tags")).get("tag")):
+            name = _lastfm_str(raw.get("name"))
+            if not name:
+                continue
+            reach = _lastfm_int(raw.get("reach"))
+            if reach is None:
+                reach = _lastfm_int(raw.get("taggings")) or 0
+            tags.append((name, reach))
+        return sorted(tags, key=lambda t: -t[1])
+
+    async def search_album(self, album: str) -> LastFMAlbum | None:
+        """The best Last.fm match for an album name, or None."""
+        body = await self._get("album.search", album=album, limit=1)
+        results = _lastfm_dict(body.get("results"))
+        found = _parse_lastfm_albums(_lastfm_dict(results.get("albummatches")))
+        return found[0] if found else None
+
 
 async def resolve_release(artist: str, album: str | None = None) -> CanonicalRelease:
     """Resolve a user-supplied artist/album to Last.fm's canonical spelling.
