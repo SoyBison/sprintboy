@@ -1,14 +1,15 @@
 import logging
 import uuid
+from dataclasses import dataclass, replace
+from typing import Callable
 
-from dotenv import load_dotenv
-from langchain.agents import create_agent
-
-from bot.config import Config
+from bot.agent import AgentResult, run_agent
 from bot.decide import current_run_id
+from bot.llm import ChatModel, Message, build_chat_model, from_dict, system, user
+from bot.output import add_nudge
 from bot.routing import Route, route
+from bot.toolkit import Tool
 from bot.tools import (
-    TorrentContext,
     add_torrent,
     download_albums,
     check_albums,
@@ -92,52 +93,6 @@ Your reply is posted straight into a Discord chat, so:
 """
 
 
-def build_llm():
-    """Build the chat model for the configured backend.
-
-    Imported lazily so that running on one backend does not require the other's
-    package to be installed or its credentials to be present.
-    """
-    Config.validate_llm()
-    if Config.LLM_PROVIDER == "ollama":
-        from langchain_ollama import ChatOllama
-
-        logger.info(
-            f"Using ollama model {Config.OLLAMA_MODEL} at {Config.OLLAMA_API_URL}"
-        )
-        return ChatOllama(
-            model=Config.OLLAMA_MODEL,
-            base_url=Config.OLLAMA_API_URL,
-            num_ctx=Config.OLLAMA_NUM_CTX,
-            # The agent picks between concrete torrents and album titles, so a
-            # creative model just invents releases that were not in the results.
-            temperature=0,
-            # Fail at startup with a clear message rather than on the first
-            # message with a 404 from a model that was never pulled.
-            validate_model_on_init=Config.OLLAMA_VALIDATE_MODEL,
-        )
-
-    from langchain_anthropic import ChatAnthropic
-
-    logger.info(f"Using anthropic model {Config.ANTHROPIC_MODEL}")
-    return ChatAnthropic(model_name=Config.ANTHROPIC_MODEL)  # type: ignore
-
-
-AGENT_TOOLS = [
-    download_albums,
-    search_for_torrent,
-    add_torrent,
-    check_albums,
-    check_for_album,
-    check_for_movie,
-    lastfm_artist_info,
-    lastfm_similar_artists,
-    lastfm_artist_albums,
-    lastfm_browse_tag,
-    lastfm_resolve,
-]
-
-
 AGENT_TOOLS = [
     download_albums,
     search_for_torrent,
@@ -183,22 +138,16 @@ def select_tools(route: Route | None) -> list:
     return AGENT_TOOLS
 
 
-_llm = None
-_agents: dict[tuple[str, ...], object] = {}
+_model: ChatModel | None = None
 
 
-def get_agent(tools):
-    """Build agents once per tool set and reuse them across messages."""
-    global _llm
-    key = tuple(t.name for t in tools)
-    agent = _agents.get(key)
-    if agent is None:
-        load_dotenv()
-        if _llm is None:
-            _llm = build_llm()
-        agent = create_agent(_llm, tools=tools, context_schema=TorrentContext)
-        _agents[key] = agent
-    return agent
+def get_model() -> ChatModel:
+    """Build the chat model once and reuse it across messages."""
+    global _model
+    if _model is None:
+        _model = build_chat_model()
+        logger.info(f"Using {type(_model).__name__} model {_model.name}")
+    return _model
 
 
 def latest_user_text(history: list[dict]) -> str:
@@ -208,8 +157,16 @@ def latest_user_text(history: list[dict]) -> str:
     return ""
 
 
-async def prepare(history: list[dict]):
-    """Route the latest message, then pick the agent, messages and run id."""
+@dataclass
+class Turn:
+    tools: list[Tool]
+    messages: list[Message]
+    route: Route | None
+    run_id: str
+
+
+async def prepare(history: list[dict]) -> Turn:
+    """Route the latest message, then pick the tools, messages and run id."""
     run_id = uuid.uuid4().hex[:12]
     current_run_id.set(run_id)
     try:
@@ -221,9 +178,33 @@ async def prepare(history: list[dict]):
     content = SYSTEM_PROMPT + ("\n\n" + note if note else "")
     tools = select_tools(decided)
     logger.info(f"Route {run_id}: {decided} tools={[t.name for t in tools]}")
-    return (
-        get_agent(tools),
-        [{"role": "system", "content": content}, *history],
-        decided,
-        run_id,
+    return Turn(
+        tools=tools,
+        messages=[system(content), *[from_dict(h) for h in history]],
+        route=decided,
+        run_id=run_id,
     )
+
+
+async def run(turn: Turn, context, on_event: Callable | None = None) -> AgentResult:
+    """Run the agent, with one follow-up if a download turn added nothing."""
+    known = set(context.internal_torrents)
+    model = get_model()
+    result = await run_agent(
+        model, turn.messages, turn.tools, context, run_id=turn.run_id, on_event=on_event
+    )
+    new_torrents = [n for n in context.internal_torrents if n not in known]
+    nudge = add_nudge(result.messages, new_torrents, turn.route)
+    # A run that used every step already tried hard; another 12 is not a nudge.
+    if not nudge or result.stopped == "max_steps":
+        return result
+    logger.info(f"Run {turn.run_id}: nudging once")
+    second = await run_agent(
+        model,
+        [*result.messages, user(nudge)],
+        turn.tools,
+        context,
+        run_id=turn.run_id,
+        on_event=on_event,
+    )
+    return replace(second, steps=[*result.steps, *second.steps], nudged=True)

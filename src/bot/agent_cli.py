@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import click
 
@@ -54,15 +55,16 @@ async def _ask(
             fg="cyan",
         )
     )
-    from bot.output import add_nudge
+    from bot.output import clean_reply
+    from bot.runlog import record_run
 
-    agent, messages, route, _run_id = await turn.prepare(
-        [{"role": "user", "content": query}]
-    )
-    if route is None:
+    started = time.perf_counter()
+    t = await turn.prepare([{"role": "user", "content": query}])
+    if t.route is None:
         click.echo(click.style("route: none", fg="cyan"))
     else:
-        tools = [t.name for t in turn.select_tools(route)]
+        route = t.route
+        tools = [tool.name for tool in t.tools]
         click.echo(
             click.style(
                 f"route: {route.domain}/{route.kind} "
@@ -71,42 +73,43 @@ async def _ask(
                 fg="cyan",
             )
         )
-    messages = await _stream(agent, messages, context)
-    # Same single retry the Discord bot makes for a search that was never added.
-    nudge = add_nudge(messages, list(context.internal_torrents), route)
-    if nudge:
-        click.echo(click.style("  (nudging: download turn added nothing)", fg="magenta"))
-        await _stream(agent, [*messages, {"role": "user", "content": nudge}], context)
+
+    def echo(event: str, data: dict) -> None:
+        if event == "tool_call":
+            click.echo(click.style(f"  → {data['name']}({data['args']})", fg="yellow"))
+        elif event == "tool_result":
+            click.echo(click.style(f"  ← {data['result'][:400]}", fg="green"))
+        elif event == "reply":
+            reply = clean_reply(data["content"])
+            if reply:
+                click.echo(reply)
+
+    result = await turn.run(t, context, on_event=echo)
+    if result.nudged:
+        click.echo(click.style("  (nudged: download turn added nothing)", fg="magenta"))
+    try:
+        from bot.output import best_reply, unfulfilled_note
+
+        new_torrents = list(context.internal_torrents)
+        reply = best_reply(result.messages, new_torrents)
+        note = unfulfilled_note(result.messages, new_torrents)
+        record_run(
+            run_id=t.run_id,
+            message_id=None,
+            conversation_id=None,
+            author="cli",
+            text=query,
+            route=t.route,
+            result=result,
+            new_torrents=new_torrents,
+            reply=reply,
+            note=note,
+            seconds=time.perf_counter() - started,
+        )
+    except Exception as e:
+        click.echo(click.style(f"Could not write the run log: {e}", fg="red"))
     await drain_shadow()
 
-
-async def _stream(agent, messages, context) -> list:
-    """Run the agent, echoing tool calls and replies, and return the final messages."""
-    from bot.output import clean_reply, message_text
-
-    final = messages
-    async for mode, chunk in agent.astream(
-        {"messages": messages},
-        context=context,
-        stream_mode=["updates", "values"],
-    ):
-        if mode == "values":
-            final = chunk.get("messages", final)
-            continue
-        for node, update in chunk.items():
-            for message in (
-                update.get("messages", []) if isinstance(update, dict) else []
-            ):
-                for call in getattr(message, "tool_calls", None) or []:
-                    click.echo(
-                        click.style(f"  → {call['name']}({call['args']})", fg="yellow")
-                    )
-                if getattr(message, "type", None) == "tool":
-                    body = message_text(message.content)
-                    click.echo(click.style(f"  ← {body[:400]}", fg="green"))
-                elif node == "model" and clean_reply(message.content):
-                    click.echo(clean_reply(message.content))
-    return final
 
 if __name__ == "__main__":
     ask()

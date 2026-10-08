@@ -1,8 +1,14 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from types import SimpleNamespace
+
+from pydantic import BaseModel
 
 from bot import turn
+from bot.llm import Message, system, user
+from bot.output import MUSIC_NUDGE
+from bot.toolkit import tool
 from bot.decide import current_run_id
 from bot.routing import Route
 
@@ -58,26 +64,91 @@ def test_latest_user_text():
 @pytest.mark.asyncio
 async def test_prepare_appends_note():
     decided = r("music", "open_ended")
-    sentinel = object()
-    with patch("bot.turn.route", AsyncMock(return_value=decided)) as m, patch(
-        "bot.turn.get_agent", return_value=sentinel
-    ):
-        agent, messages, got, run_id = await turn.prepare(HISTORY)
-    assert agent is sentinel and got is decided
+    with patch("bot.turn.route", AsyncMock(return_value=decided)) as m:
+        t = await turn.prepare(HISTORY)
+    assert t.route is decided
     assert m.await_args.args[0] == "five albums like Slowdive"
-    assert messages[0]["content"] == turn.SYSTEM_PROMPT + "\n\n" + decided.note()
-    assert messages[1:] == HISTORY
-    assert current_run_id.get() == run_id
+    assert t.messages[0].role == "system"
+    assert t.messages[0].content == turn.SYSTEM_PROMPT + "\n\n" + decided.note()
+    assert [(m.role, m.content) for m in t.messages[1:]] == [
+        (h["role"], h["content"]) for h in HISTORY
+    ]
+    assert all(isinstance(m, Message) for m in t.messages)
+    assert t.tools == turn.MUSIC_READ + turn.MUSIC_DOWNLOAD
+    assert current_run_id.get() == t.run_id
 
 
 @pytest.mark.asyncio
 async def test_prepare_without_route():
-    with patch("bot.turn.route", AsyncMock(return_value=None)), patch(
-        "bot.turn.get_agent", return_value=object()
-    ):
-        _, messages, got, _ = await turn.prepare(HISTORY)
-    assert got is None
-    assert messages[0]["content"] == turn.SYSTEM_PROMPT
+    with patch("bot.turn.route", AsyncMock(return_value=None)):
+        t = await turn.prepare(HISTORY)
+    assert t.route is None
+    assert t.messages[0].content == turn.SYSTEM_PROMPT
+    assert t.tools is turn.AGENT_TOOLS
+
+
+class FakeModel:
+    name = "fake"
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    async def chat(self, messages, tools):
+        self.calls.append(list(messages))
+        return self.replies.pop(0)
+
+
+class NoArgs(BaseModel):
+    pass
+
+
+@tool(args_schema=NoArgs)
+async def download_albums(runtime) -> str:
+    """Stub."""
+    runtime.context.internal_torrents["Album"] = "hash"
+    return "Added"
+
+
+def make_turn(tools):
+    return turn.Turn(
+        tools=tools,
+        messages=[system("sys"), user("five albums like Slowdive")],
+        route=r("music", "open_ended"),
+        run_id="r1",
+    )
+
+
+def context():
+    return SimpleNamespace(internal_torrents={})
+
+
+@pytest.mark.asyncio
+async def test_run_nudges_once_when_nothing_was_added(monkeypatch):
+    model = FakeModel([Message("assistant", "Added: stuff"), Message("assistant", "Sorry")])
+    monkeypatch.setattr(turn, "get_model", lambda: model)
+    result = await turn.run(make_turn([download_albums]), context())
+    assert result.nudged
+    assert len(model.calls) == 2
+    nudge = model.calls[1][-1]
+    assert (nudge.role, nudge.content) == ("user", MUSIC_NUDGE)
+    assert result.messages[-1].content == "Sorry"
+    assert [s.kind for s in result.steps] == ["model", "model"]
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_nudge_after_an_add(monkeypatch):
+    call = {"id": "c1", "name": "download_albums", "args": {}}
+    model = FakeModel(
+        [Message("assistant", "", tool_calls=[call]), Message("assistant", "Added Album")]
+    )
+    monkeypatch.setattr(turn, "get_model", lambda: model)
+    ctx = context()
+    result = await turn.run(make_turn([download_albums]), ctx)
+    assert not result.nudged
+    assert len(model.calls) == 2
+    assert ctx.internal_torrents == {"Album": "hash"}
+    assert result.messages[-1].content == "Added Album"
 
 
 @pytest.mark.asyncio

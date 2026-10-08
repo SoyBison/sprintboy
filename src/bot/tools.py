@@ -4,7 +4,7 @@ import logging
 from typing import Union
 
 import aiohttp
-from langchain.tools import ToolRuntime, tool
+from bot.toolkit import Runtime, tool
 from bot.netcode import (
     BTCategory,
     CanonicalRelease,
@@ -84,7 +84,7 @@ def _media_label(r, media: str | None) -> str:
 async def search_for_torrent(
     queries: list[str],
     category: BTCategory,
-    runtime: ToolRuntime[TorrentContext],
+    runtime: Runtime,
     media: str | None = None,
 ) -> str:
     """
@@ -204,7 +204,7 @@ async def _add_one(name: str, category: BTCategory, context: TorrentContext, cor
 
 @tool(args_schema=TorrentAddQuery)
 async def add_torrent(
-    names: list[str], category: BTCategory, runtime: ToolRuntime[TorrentContext]
+    names: list[str], category: BTCategory, runtime: Runtime
 ) -> str:
     """Add torrents to qBittorrent using names retrieved from a previous search. Fuzzy search.
 
@@ -561,9 +561,22 @@ class LastFMSimilarQuery(BaseModel):
     limit: int = 15
 
 
+# Past this the list is mostly singles and compilations, and a small model
+# spends a minute reasoning over 100 titles it will not pick.
+MAX_ALBUMS_PER_ARTIST = 30
+
+
 class LastFMAlbumsQuery(BaseModel):
     artists: list[str]
     limit: int = 15
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def _clamp_limit(cls, value):
+        try:
+            return max(1, min(int(value), MAX_ALBUMS_PER_ARTIST))
+        except (TypeError, ValueError):
+            return 15
 
     @field_validator("artists", mode="before")
     @classmethod
@@ -866,7 +879,7 @@ def _title_matches(wanted: str, found: str) -> bool:
 @tool(args_schema=DownloadAlbumsQuery)
 async def download_albums(
     albums: list[AlbumRef],
-    runtime: ToolRuntime[TorrentContext],
+    runtime: Runtime,
     media: str | None = None,
 ) -> str:
     """Get albums in one step: checks the library, searches, picks the best version (SACD and perfect CD rips first, never vinyl unless asked; set media only when the user asks for CD, SACD, WEB or Vinyl) and adds it. Pass every album you chose in one call, using Last.fm spellings. Only items reported as 'Added' are downloading."""

@@ -1,5 +1,6 @@
 import functools
 import logging
+import logging.handlers
 import os
 import subprocess
 from pathlib import Path
@@ -17,7 +18,6 @@ _NOISY_LOGGERS = (
     "httpcore",
     "httpx",
     "urllib3",
-    "langsmith",
     "discord.gateway",
     "discord.client",
     "discord.http",
@@ -25,8 +25,26 @@ _NOISY_LOGGERS = (
 
 
 def setup_logging(level: str | int | None = None) -> None:
-    """Configure logging at the requested level, minus the third party noise."""
-    logging.basicConfig(level=level or Config.LOG_LEVEL, format=LOG_FORMAT, force=True)
+    """Configure logging at the requested level, minus the third party noise.
+
+    Besides stderr (what `docker logs` shows), everything goes to a rotating
+    file under the mounted data volume: the container's own log is thrown away
+    every time a deploy recreates it.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if Config.LOG_FILE:
+        try:
+            Path(Config.LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(
+                logging.handlers.RotatingFileHandler(
+                    Config.LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=10
+                )
+            )
+        except OSError as e:
+            print(f"Not logging to {Config.LOG_FILE}: {e}")
+    logging.basicConfig(
+        level=level or Config.LOG_LEVEL, format=LOG_FORMAT, handlers=handlers, force=True
+    )
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
 
@@ -57,6 +75,12 @@ class Config:
     AOTM_FREELEECH_DAYS = 14
     # Add more config as needed
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    # Rotating log file (10 x 10MB) on the data volume, which survives deploys.
+    # Empty disables it.
+    LOG_FILE = os.getenv("LOG_FILE", "data/logs/sprintboy.log")
+    # One JSON line per agent turn: the message, route, every tool call with
+    # its arguments and result, the reply and what was added.
+    RUN_LOG_PATH = os.getenv("RUN_LOG_PATH", "data/runs.jsonl")
 
     # Which backend the agent runs on: "anthropic" for the API, "ollama" for a
     # self-hosted model.

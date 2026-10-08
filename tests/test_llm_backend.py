@@ -55,17 +55,16 @@ def test_anthropic_does_not_need_an_ollama_url(restore_config):
     Config.validate_llm()
 
 
-def test_build_llm_uses_the_configured_ollama_model(restore_config, monkeypatch):
-    from bot import main
+def test_build_chat_model_uses_the_configured_ollama_model(restore_config, monkeypatch):
+    from bot.llm import OllamaChat, build_chat_model
 
     Config.LLM_PROVIDER = "ollama"
     Config.OLLAMA_API_URL = "http://ollama.invalid:11434"
     Config.OLLAMA_MODEL = "gpt-oss:20b"
     monkeypatch.setattr(Config, "OLLAMA_NUM_CTX", 4096)
-    # Otherwise the client pings the server to check the model exists.
-    monkeypatch.setattr(Config, "OLLAMA_VALIDATE_MODEL", False)
-    llm = main.build_llm()
+    llm = build_chat_model()
 
+    assert isinstance(llm, OllamaChat)
     assert llm.model == "gpt-oss:20b"
     assert llm.base_url == "http://ollama.invalid:11434"
     assert llm.num_ctx == 4096

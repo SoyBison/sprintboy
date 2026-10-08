@@ -1,6 +1,6 @@
 # Sprintboy
 
-A simple langchain-based tool for adding music to my Plex server.
+A simple tool for adding music to my Plex server.
 
 ## Set up using uv
 

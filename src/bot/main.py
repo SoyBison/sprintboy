@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 import discord
 from discord.ext import commands
@@ -12,12 +13,12 @@ from bot.netcode import (
 
 from bot.tools import TorrentContext
 from bot import aotm, turn
-from bot.turn import SYSTEM_PROMPT, AGENT_TOOLS, build_llm  # noqa: F401
+from bot.llm import OllamaChat
+from bot.runlog import record_run
 from bot.output import (
     best_reply,
     describe_failure,
     name_list,
-    add_nudge,
     split_for_discord,
     summarise_run,
     unfulfilled_note,
@@ -105,6 +106,19 @@ async def reply_in_chunks(message: discord.Message, text: str) -> discord.Messag
     return target
 
 
+DOWNLOAD_POLL_SECONDS = 5
+DOWNLOAD_LOG_SECONDS = 60
+
+
+def progress_line(infos: list[TorrentInfoResponse]) -> str:
+    """One compact line for the log: `Waiting on 2 torrent(s): name 34% 3.1MB/s, ...`."""
+    parts = [
+        f"{info.name} {info.progress * 100:.0f}% {info.dlspeed / 1_000_000:.1f}MB/s"
+        for info in infos
+    ]
+    return f"Waiting on {len(infos)} torrent(s): {', '.join(parts)}"
+
+
 async def wait_for_downloads(
     message: discord.Message, torrent_context: TorrentContext, new_torrents: list[str]
 ):
@@ -119,6 +133,7 @@ async def wait_for_downloads(
         # through to announcing a finished download that never started.
         logger.warning(f"Nothing to wait for out of {new_torrents}")
         return
+    last_logged = float("-inf")
     while True:
         async with QBittorrentClient() as qclient:
             torrent_info_promises = []
@@ -126,7 +141,6 @@ async def wait_for_downloads(
                 memory_code = torrent_context.internal_torrents[name]
                 torrent_info_promises.append(qclient.get_torrent_info(memory_code))
             torrent_info = await asyncio.gather(*torrent_info_promises)
-            logger.info(f"Torrent info: {torrent_info}")
             # Record sync targets before checking for completion, otherwise a
             # torrent that is already done on the first poll never gets scanned.
             for info in torrent_info:
@@ -135,9 +149,14 @@ async def wait_for_downloads(
                 torrent_sync_targets[info.content_path] = BTCategory(
                     info.category.lower()
                 )
-            if all([info.progress == 1.0 for info in torrent_info]):
+            done = all([info.progress == 1.0 for info in torrent_info])
+            if done or time.monotonic() - last_logged >= DOWNLOAD_LOG_SECONDS:
+                line = progress_line(torrent_info)
+                logger.info(f"Finished. {line}" if done else line)
+                last_logged = time.monotonic()
+            if done:
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(DOWNLOAD_POLL_SECONDS)
 
     # Trigger a plex sync
     async with PlexAPIClient() as plex_client:
@@ -178,6 +197,15 @@ async def on_ready():
         f"{bot.user} is running in {Config.ENVIRONMENT} mode on commit {git_sha()}"
     )
     logger.info(f"Bot is in {len(bot.guilds)} guilds")
+
+    if Config.LLM_PROVIDER == "ollama" and Config.OLLAMA_VALIDATE_MODEL:
+        # Say so at startup rather than as a 404 on the first message.
+        try:
+            model = turn.get_model()
+            if isinstance(model, OllamaChat):
+                await model.validate()
+        except Exception as e:
+            logger.error(f"The ollama model is not usable: {e}")
 
     # Sync slash commands with Discord
     try:
@@ -223,45 +251,45 @@ async def on_message(message: discord.Message):
     history, root_id = await build_conversation(message)
     torrent_context = get_conversation_context(root_id)
     known_torrents = set(torrent_context.internal_torrents)
-    run_id = None
+    started = time.perf_counter()
 
     async with message.channel.typing():
         try:
-            agent, messages, route, run_id = await turn.prepare(history)
+            t = await turn.prepare(history)
             logger.info(
-                f"Handling message {message.id} in conversation {root_id} run {run_id}"
+                f"Handling message {message.id} in conversation {root_id} run {t.run_id}"
             )
-            response = await agent.ainvoke(
-                {"messages": messages},
-                context=torrent_context,
-            )
-            nudge = add_nudge(
-                response["messages"], _new(torrent_context, known_torrents), route
-            )
-            if nudge:
-                logger.info(f"Run {run_id}: download turn added nothing; nudging once")
-                response = await agent.ainvoke(
-                    {
-                        "messages": [
-                            *response["messages"],
-                            {"role": "user", "content": nudge},
-                        ]
-                    },
-                    context=torrent_context,
-                )
+            result = await turn.run(t, torrent_context)
         except Exception as e:
             logger.exception("Agent invocation failed")
             await reply_in_chunks(message, describe_failure(e))
             return
 
-    logger.info(f"Run {run_id}: {summarise_run(response['messages'])}")
+    logger.info(f"Run {t.run_id}: {summarise_run(result.messages)}")
     new_torrents = _new(torrent_context, known_torrents)
-    reply = best_reply(response["messages"], new_torrents)
-    note = unfulfilled_note(response["messages"], new_torrents)
+    reply = best_reply(result.messages, new_torrents)
+    note = unfulfilled_note(result.messages, new_torrents)
     if note:
         logger.warning(f"Correcting an unfulfilled reply: {reply[:200]!r}")
         reply = f"{reply}\n\n**{note}**"
     last_message = await reply_in_chunks(message, reply)
+
+    try:
+        record_run(
+            run_id=t.run_id,
+            message_id=message.id,
+            conversation_id=root_id,
+            author=message.author,
+            text=turn.latest_user_text(history),
+            route=t.route,
+            result=result,
+            new_torrents=new_torrents,
+            reply=reply,
+            note=note,
+            seconds=time.perf_counter() - started,
+        )
+    except Exception:
+        logger.exception("Writing the run log failed")
 
     if new_torrents:
         try:
