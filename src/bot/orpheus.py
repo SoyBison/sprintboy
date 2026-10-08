@@ -168,6 +168,7 @@ class AotmTorrent:
     seeders: int
     size: int
     freeleech: bool
+    cover: str = ""
 
     @property
     def label(self) -> str:
@@ -216,6 +217,7 @@ def pick_freeleech_torrent(results: list[dict]) -> AotmTorrent | None:
         seeders=int(t.get("seeders", 0)),
         size=int(t.get("size", 0)),
         freeleech=True,
+        cover=str(g.get("cover") or ""),
     )
 
 

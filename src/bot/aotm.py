@@ -181,7 +181,14 @@ async def check_and_ask(bot, owner) -> str:
     view = discord.ui.View(timeout=None)
     view.add_item(AotmButton("grab", torrent.torrent_id, pick.key))
     view.add_item(AotmButton("skip", torrent.torrent_id, pick.key))
-    message = await owner.send(content, view=view)
+    embed = None
+    if torrent.cover.startswith(("http://", "https://")):
+        embed = discord.Embed(
+            title=f"{torrent.artist} - {torrent.group_name}",
+            url=f"{Config.ORPHEUS_URL}/torrents.php?id={torrent.group_id}",
+        )
+        embed.set_image(url=torrent.cover)
+    message = await owner.send(content, embed=embed, view=view)
     state[pick.key] = {
         "status": "asked",
         "torrent_id": torrent.torrent_id,

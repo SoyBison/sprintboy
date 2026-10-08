@@ -61,3 +61,15 @@ async def test_current_pick_expires():
 
     late = datetime(2026, 10, 20, tzinfo=timezone.utc)
     assert await current_pick(client, now=late) is None
+
+
+def test_freeleech_torrent_carries_the_cover():
+    import json
+    from pathlib import Path
+
+    from bot.orpheus import pick_freeleech_torrent
+
+    results = json.loads(
+        (Path(__file__).parent / "fixtures" / "ops_browse_aotm.json").read_text()
+    )["response"]["results"]
+    assert pick_freeleech_torrent(results).cover.startswith("https://")
