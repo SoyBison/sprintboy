@@ -8,6 +8,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import discord
 from discord.ext import tasks
@@ -185,7 +186,12 @@ async def check_and_ask(bot, owner) -> str:
     if torrent.cover.startswith(("http://", "https://")):
         embed = discord.Embed(
             title=f"{torrent.artist} - {torrent.group_name}",
-            url=f"{Config.ORPHEUS_URL}/torrents.php?id={torrent.group_id}",
+            # A public page: Orpheus links only work in a logged-in browser,
+            # which the one Discord opens never is.
+            url=(
+                "https://www.last.fm/music/"
+                f"{quote_plus(pick.artist)}/{quote_plus(pick.album)}"
+            ),
         )
         embed.set_image(url=torrent.cover)
     message = await owner.send(content, embed=embed, view=view)
