@@ -1,8 +1,11 @@
+import inspect
 import logging
+import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Callable
 
+from bot import workflows
 from bot.agent import AgentResult, run_agent
 from bot.decide import current_run_id
 from bot.llm import ChatModel, Message, build_chat_model, from_dict, system, user
@@ -163,14 +166,16 @@ class Turn:
     messages: list[Message]
     route: Route | None
     run_id: str
+    text: str = ""
 
 
 async def prepare(history: list[dict]) -> Turn:
     """Route the latest message, then pick the tools, messages and run id."""
     run_id = uuid.uuid4().hex[:12]
     current_run_id.set(run_id)
+    text = latest_user_text(history)
     try:
-        decided = await route(latest_user_text(history), run_id=run_id)
+        decided = await route(text, run_id=run_id)
     except Exception:
         logger.warning("Routing failed; using all tools", exc_info=True)
         decided = None
@@ -183,11 +188,39 @@ async def prepare(history: list[dict]) -> Turn:
         messages=[system(content), *[from_dict(h) for h in history]],
         route=decided,
         run_id=run_id,
+        text=text,
     )
 
 
 async def run(turn: Turn, context, on_event: Callable | None = None) -> AgentResult:
-    """Run the agent, with one follow-up if a download turn added nothing."""
+    """Run the agent, with one follow-up if a download turn added nothing.
+
+    Requests with a known shape go to a workflow first; it returns None when it
+    cannot handle the message, and the agent takes over.
+    """
+    decided = turn.route
+    if (
+        decided
+        and decided.trusted
+        and decided.domain == "music"
+        and decided.kind == "discography"
+    ):
+        started = time.perf_counter()
+        try:
+            wf = await workflows.discography(turn.text, context, run_id=turn.run_id)
+        except Exception:
+            logger.exception(f"Run {turn.run_id}: discography workflow failed")
+            wf = None
+        if wf is not None:
+            if on_event:
+                emitted = on_event("reply", {"content": wf.reply})
+                if inspect.isawaitable(emitted):
+                    await emitted
+            logger.info(
+                f"Run {turn.run_id}: handled by the discography workflow "
+                f"in {time.perf_counter() - started:.1f}s"
+            )
+            return wf.to_agent_result(turn.messages)
     known = set(context.internal_torrents)
     model = get_model()
     result = await run_agent(

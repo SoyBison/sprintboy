@@ -141,3 +141,26 @@ def test_title_match_allows_editions_but_not_other_albums():
     assert not _title_matches("Mordechai", "Mordechai Remixes")
     assert not _title_matches("Texas Sun", "Texas Moon")
     assert not _title_matches("The Universe Smiles Upon You", "The Universe Smiles Upon You ii")
+
+
+def test_volume_numbers_separate_albums():
+    from bot.tools import _ownership, _title_matches, release_numbers
+
+    assert release_numbers("Djesse Vol. 4") == {"4"}
+    assert release_numbers("The Universe Smiles Upon You ii") == {"2"}
+    assert release_numbers("OK Computer OKNOTOK 1997 2017") == frozenset()
+    assert release_numbers("I Am a Bird Now") == frozenset()
+    assert not _title_matches("Djesse Vol. 4", "Djesse Vol. 3")
+    assert not _title_matches("Texas Sun", "Texas")
+    assert _title_matches("Djesse Vol. 4", "Djesse, Vol. 4 (Deluxe)")
+    assert _ownership(["The Universe Smiles Upon You"], "The Universe Smiles Upon You ii") == ""
+    assert _ownership(["Djesse, Vol. 3"], "Djesse Vol. 4") == ""
+    assert _ownership(["Djesse, Vol. 4"], "Djesse Vol. 4") == " [OWNED]"
+    assert _ownership(["OK Computer"], "OK Computer OKNOTOK 1997 2017") != ""
+
+
+def test_unnumbered_title_is_a_maybe_for_volume_one():
+    from bot.tools import _ownership
+
+    assert _ownership(["Djesse"], "Djesse, Vol. 1").startswith(" [maybe owned as 'Djesse'")
+    assert _ownership(["Djesse"], "Djesse Vol. 2") == ""

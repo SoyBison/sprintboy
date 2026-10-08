@@ -284,6 +284,33 @@ async def _canonicalise(artist: str, title: str | None) -> CanonicalRelease:
         )
 
 
+_ROMAN = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"}
+_NUMBER_WORD = re.compile(r"[a-z0-9]+")
+
+
+def release_numbers(title: str) -> frozenset[str]:
+    """The volume/part numbers in a title: "Vol. 4" -> {"4"}, "... ii" -> {"2"}.
+
+    Four-digit years are left out, since "OK Computer OKNOTOK 1997 2017" is
+    still OK Computer. A lone "i" only counts after vol/part/pt/book.
+    """
+    words = _NUMBER_WORD.findall(title.casefold())
+    numbers = set()
+    for index, word in enumerate(words):
+        if word.isdigit() and len(word) < 4:
+            numbers.add(str(int(word)))
+        elif word in _ROMAN and (
+            word != "i" or (index and words[index - 1] in ("vol", "volume", "part", "pt", "book"))
+        ):
+            numbers.add(str(["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"].index(word) + 1))
+    return frozenset(numbers)
+
+
+def numbers_compatible(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Equal numbers, or one side unnumbered and the other volume 1."""
+    return a == b or {a, b} == {frozenset(), frozenset({"1"})}
+
+
 def _album_scores(candidates: list[str], name: str) -> tuple[int, int]:
     """Score a library album title against the titles we are looking for.
 
@@ -294,7 +321,19 @@ def _album_scores(candidates: list[str], name: str) -> tuple[int, int]:
     is why containment alone is never treated as a collision.
     """
     lowered = name.lower()
-    whole = max(fuzz.token_sort_ratio(c.lower(), lowered) for c in candidates)
+    # "Djesse Vol. 3" and "Djesse Vol. 4", or "...Upon You" and "...Upon You ii",
+    # are 95% the same string and entirely different albums.
+    number = release_numbers(name)
+    candidates = [c for c in candidates if numbers_compatible(release_numbers(c), number)]
+    if not candidates:
+        return 0, 0
+    whole = max(
+        fuzz.token_sort_ratio(c.lower(), lowered)
+        # "Djesse" for "Djesse Vol. 1" is probably the same album, but only
+        # probably: never a certain collision, always a maybe for the judge.
+        if release_numbers(c) == number else min(89, fuzz.token_sort_ratio(c.lower(), lowered))
+        for c in candidates
+    )
     contained = max(fuzz.partial_ratio(c.lower(), lowered) for c in candidates)
     return whole, contained
 
@@ -868,10 +907,15 @@ def _title_matches(wanted: str, found: str) -> bool:
     a, b = wanted.casefold(), found.casefold()
     if re.sub(r"[\W_]+", "", a) == re.sub(r"[\W_]+", "", b):
         return True
+    if not numbers_compatible(release_numbers(a), release_numbers(b)):
+        return False
     want = set(_WORD.findall(a))
-    extra = {w for w in set(_WORD.findall(b)) - want if not w.isdigit()}
-    # "The Universe Smiles Upon You ii" is a different album however close.
-    if not want or not extra <= _EDITION_WORDS:
+    got = set(_WORD.findall(b))
+    # Years ("2017 Remaster") and edition words may be added; nothing else may
+    # be added or missing: "Texas" is not "Texas Sun", "...ii" is not "...".
+    extra = {w for w in got - want if not (w.isdigit() and len(w) == 4)}
+    missing = want - got - {"the", "a", "an", "and", "&"}
+    if not want or missing or not extra <= _EDITION_WORDS:
         return False
     return fuzz.token_set_ratio(a, b) >= 90
 

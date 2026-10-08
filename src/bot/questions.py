@@ -44,3 +44,32 @@ SAME_RELEASE_QUESTIONS = {
         ),
     },
 }
+
+DISCOGRAPHY_QUESTIONS_NAME = "discography/v2"
+
+
+def discography_questions(spans: list[str]) -> dict:
+    """Which span of the message names the artist, and which of their releases are wanted."""
+    return {
+        "artist": {
+            "type": "choice",
+            "instructions": "Which of these is the name of the artist whose releases the message asks for?",
+            "criteria": {span: None for span in spans}
+            | {"none": "none of these is an artist name"},
+        },
+        "scope": {
+            "type": "choice",
+            "instructions": "Which of the artist's releases does the message want?",
+            "criteria": {
+                "albums": (
+                    "their albums. The default for 'discography', 'the rest of', "
+                    "'collection', 'catalogue' or 'everything by'"
+                ),
+                "everything": (
+                    "only when the message explicitly asks for singles, EPs, live "
+                    "records or B-sides as well as albums"
+                ),
+                "newest": "only their newest or latest release",
+            },
+        },
+    }
