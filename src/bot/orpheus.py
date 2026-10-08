@@ -182,6 +182,20 @@ class AccountStats:
     tokens: int
     user_class: str
 
+    @property
+    def exact_ratio(self) -> float:
+        """Uploaded / downloaded. The API's `ratio` is rounded to two places,
+        which hides the difference between 0.6049 and 0.5951."""
+        return self.uploaded / self.downloaded if self.downloaded else float("inf")
+
+    @property
+    def headroom(self) -> int:
+        """Bytes that can still be downloaded (not freeleech) before the ratio
+        drops below the required one; negative when already below it."""
+        if not self.required_ratio:
+            return 1 << 62
+        return int(self.uploaded / self.required_ratio) - self.downloaded
+
 
 @dataclass(frozen=True)
 class ShopItem:

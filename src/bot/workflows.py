@@ -1260,11 +1260,27 @@ def status_reply(stats: AccountStats) -> str:
     text = (
         f"You have {_tokens(stats.tokens)} and {stats.bonus_points:,} bonus points "
         f"(+{stats.bonus_per_hour:.0f}/hour, about {per_day:,}/day). "
-        f"Ratio {stats.ratio:.2f} (you need {stats.required_ratio:.2f})."
+        f"Ratio {stats.exact_ratio:.4f} (you need {stats.required_ratio:.2f})."
     )
-    if stats.ratio < stats.required_ratio + 0.05:
-        text += "\n⚠️ That's close to ratio watch: use tokens on big downloads."
+    if stats.headroom < 0:
+        text += (
+            f"\n🚨 You're below your required ratio: upload {_size(-stats.headroom * stats.required_ratio)} "
+            f"or use freeleech to get back above it."
+        )
+    elif stats.exact_ratio < stats.required_ratio + 0.05:
+        text += (
+            f"\n⚠️ Close to ratio watch: only {_size(stats.headroom)} of non-freeleech "
+            f"downloading left. Use tokens on big downloads."
+        )
     return text
+
+
+def _size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
 
 
 def _orpheus_failure(e: Exception) -> str:

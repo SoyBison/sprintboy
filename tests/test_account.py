@@ -42,8 +42,11 @@ SHOP = """
 """
 
 
+GB = 1024**3
+
+
 def stats(**kw):
-    base = dict(username="me", uploaded=1, downloaded=1, ratio=1.5, required_ratio=0.6,
+    base = dict(username="me", uploaded=150 * GB, downloaded=100 * GB, ratio=1.5, required_ratio=0.6,
                 bonus_points=5000, bonus_per_hour=100.0, tokens=6, user_class="User")
     return AccountStats(**{**base, **kw})
 
@@ -155,11 +158,17 @@ async def test_status_and_ratio_warning():
     r = await run_account("tokens?", FakeClient(), "status")
     assert r.reply == (
         "You have 6 freeleech tokens and 5,000 bonus points (+100/hour, about 2,400/day). "
-        "Ratio 1.50 (you need 0.60)."
+        "Ratio 1.5000 (you need 0.60)."
     )
     assert r.confirm is None
-    r = await run_account("ratio?", FakeClient(stats(ratio=0.61)), "status")
-    assert "close to ratio watch" in r.reply
+    # The exact ratio comes from the byte counts, not the API's rounded one.
+    close = stats(uploaded=6010 * GB // 100, downloaded=100 * GB, ratio=0.6)
+    r = await run_account("ratio?", FakeClient(close), "status")
+    assert "Ratio 0.6010" in r.reply and "Close to ratio watch" in r.reply
+    assert "170.7 MB" in r.reply  # 60.10 GiB / 0.6 - 100 GiB of headroom
+    below = stats(uploaded=59 * GB, downloaded=100 * GB, ratio=0.59)
+    r = await run_account("ratio?", FakeClient(below), "status")
+    assert "below your required ratio" in r.reply
 
 
 @pytest.mark.asyncio
