@@ -86,10 +86,42 @@ class Route:
         )
 
 
-async def route(message: str, run_id: str | None = None) -> Route | None:
-    """Classify the latest message, or None if no decision backend answered."""
+# How much of the conversation the router sees: enough to resolve "that" and
+# "it", little enough to stay a ~0.2s call. Bot replies can be long lists.
+EARLIER_TURNS = 4
+EARLIER_CHARS = 300
+
+
+def route_state(message: str, earlier: list[dict] | None = None) -> dict:
+    """The router's input: the newest message plus the last few turns before it."""
+    state: dict = {"message": message}
+    turns = [
+        {
+            "from": "bot" if entry.get("role") == "assistant" else "user",
+            "text": _clip(str(entry.get("content", ""))),
+        }
+        for entry in (earlier or [])[-EARLIER_TURNS:]
+        if str(entry.get("content", "")).strip()
+    ]
+    if turns:
+        state["earlier"] = turns
+    return state
+
+
+def _clip(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= EARLIER_CHARS else text[: EARLIER_CHARS - 1] + "…"
+
+
+async def route(
+    message: str, run_id: str | None = None, earlier: list[dict] | None = None
+) -> Route | None:
+    """Classify the latest message in its conversation, or None if no backend answered.
+
+    `earlier` is the history before the message, as {"role", "content"} dicts.
+    """
     decision = await decide(
-        ROUTE_QUESTIONS_NAME, {"message": message}, ROUTE_QUESTIONS, run_id=run_id
+        ROUTE_QUESTIONS_NAME, route_state(message, earlier), ROUTE_QUESTIONS, run_id=run_id
     )
     if decision is None:
         return None

@@ -68,6 +68,8 @@ async def test_prepare_appends_note():
         t = await turn.prepare(HISTORY)
     assert t.route is decided
     assert m.await_args.args[0] == "five albums like Slowdive"
+    # The router sees the conversation before the latest message.
+    assert m.await_args.kwargs["earlier"] == HISTORY[:-1]
     assert t.messages[0].role == "system"
     assert t.messages[0].content == turn.SYSTEM_PROMPT + "\n\n" + decided.note()
     assert [(m.role, m.content) for m in t.messages[1:]] == [
@@ -167,3 +169,22 @@ async def test_decide_retries_a_jev_503_once(monkeypatch):
     monkeypatch.setattr(d.asyncio, "sleep", AsyncMock())
     result = await d.decide("t/v1", {"x": 1}, {"q": {"type": "noul", "instructions": "?"}})
     assert result is ok and ask.await_count == 2
+
+
+def test_route_state_keeps_the_last_few_turns_clipped():
+    from bot.routing import EARLIER_CHARS, EARLIER_TURNS, route_state
+
+    assert route_state("hi") == {"message": "hi"}
+    earlier = [
+        {"role": "user", "content": "get me the weather report album with fast city"},
+        {"role": "assistant", "content": "Added Heavy Weather. " + "x" * 1000},
+        {"role": "user", "content": "   "},
+    ]
+    state = route_state("it's on night passage", earlier)
+    assert state["message"] == "it's on night passage"
+    assert [t["from"] for t in state["earlier"]] == ["user", "bot"]
+    assert len(state["earlier"][1]["text"]) == EARLIER_CHARS
+    many = [{"role": "user", "content": str(i)} for i in range(10)]
+    assert [t["text"] for t in route_state("m", many)["earlier"]] == [
+        str(i) for i in range(10 - EARLIER_TURNS, 10)
+    ]

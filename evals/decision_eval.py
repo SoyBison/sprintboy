@@ -69,6 +69,34 @@ ROUTE_CASES = [
     ("why didn't that download work", "chat", "question"),
 ]
 
+# Follow-ups, from a real conversation the v1 router lost track of:
+# (message, earlier turns, domain, kind)
+FOLLOWUP_CASES = [
+    ("No dumbass the album that has the track fast city",
+     [("user", "Get me the weather report album with fast city"),
+      ("bot", "Added Heavy Weather by Weather Report.")], "music", "specific"),
+    ("That's not correct",
+     [("user", "Get me the weather report album with fast city"),
+      ("bot", "Heavy Weather is already in your library.")], "music", "specific"),
+    ("It's on night passage but nice try",
+     [("user", "No dumbass the album that has the track fast city"),
+      ("bot", "You already have Heavy Weather by Weather Report, which has Fast City.")],
+     "music", "specific"),
+    ("more like that",
+     [("user", "get me Mordechai by Khruangbin"), ("bot", "Added Mordechai.")],
+     "music", "open_ended"),
+    ("yeah do the deluxe one instead",
+     [("user", "get Djesse Vol. 4"), ("bot", "Added Djesse Vol. 4 (standard edition).")],
+     "music", "specific"),
+    ("thanks!",
+     [("user", "get me Mordechai"), ("bot", "Added Mordechai.")], "chat", "question"),
+    ("did that finish?",
+     [("user", "get me Mordechai"), ("bot", "Added Mordechai.")], "chat", "question"),
+    ("and season 3?",
+     [("user", "get season 2 of Severance"), ("bot", "Added Severance S02.")], "tv", "specific"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Same release: the "maybe owned as" cases check_for_album hands the LLM today
 # ---------------------------------------------------------------------------
@@ -101,6 +129,16 @@ async def ask(session, backend: str, state, questions: dict, refresh: bool) -> d
     path = _cache_path(backend, body)
     if path.exists() and not refresh:
         return json.loads(path.read_text())
+    for attempt in range(3):
+        try:
+            return await _post(session, backend, url, key_var, body, path)
+        except RuntimeError as e:
+            if " 5" not in str(e)[:10] or attempt == 2:
+                raise
+            await asyncio.sleep(1 + attempt)
+
+
+async def _post(session, backend, url, key_var, body, path) -> dict:
     start = time.perf_counter()
     async with session.post(
         f"{url}/v1/systemone",
@@ -130,16 +168,25 @@ async def run(backend: str, refresh: bool):
         routes = await asyncio.gather(
             *[one({"message": m}, ROUTE_QUESTIONS) for m, _, _ in ROUTE_CASES]
         )
+        followups = await asyncio.gather(
+            *[
+                one(
+                    {"message": m, "earlier": [{"from": f, "text": t} for f, t in earlier]},
+                    ROUTE_QUESTIONS,
+                )
+                for m, earlier, _, _ in FOLLOWUP_CASES
+            ]
+        )
         releases = await asyncio.gather(
             *[
                 one({"candidate": c, "owned": o}, SAME_RELEASE_QUESTIONS)
                 for c, o, _ in RELEASE_CASES
             ]
         )
-    return routes, releases
+    return routes, followups, releases
 
 
-def report(name: str, routes, releases):
+def report(name: str, routes, followups, releases):
     domain_ok = kind_ok = open_ok = 0
     misses = []
     for (message, domain, kind), result in zip(ROUTE_CASES, routes):
@@ -155,6 +202,18 @@ def report(name: str, routes, releases):
                 f"kind {a['kind']['choice']} {a['kind']['confidence']:.2f} (want {kind}), "
                 f"open {got_open:.2f}"
             )
+    follow_ok = 0
+    for (message, _, domain, kind), result in zip(FOLLOWUP_CASES, followups):
+        a = result["answers"]
+        good = a["kind"]["choice"] == kind and (
+            a["domain"]["choice"] == domain or kind == "question"
+        )
+        follow_ok += good
+        if not good:
+            misses.append(
+                f"  follow-up {message!r}: {a['domain']['choice']}/{a['kind']['choice']} "
+                f"{a['kind']['confidence']:.2f} (want {domain}/{kind})"
+            )
     release_ok = 0
     for (candidate, owned, same), result in zip(RELEASE_CASES, releases):
         p = result["answers"]["same_release"]["noul"]
@@ -162,13 +221,14 @@ def report(name: str, routes, releases):
         if (p >= 0.5) != same:
             misses.append(f"  same? {candidate!r} vs {owned!r}: {p:.2f} (want {same})")
 
-    latencies = sorted(r.get("_latency", 0) for r in [*routes, *releases])
-    tokens = sum(r.get("usage", {}).get("input_tokens", 0) for r in [*routes, *releases])
+    latencies = sorted(r.get("_latency", 0) for r in [*routes, *followups, *releases])
+    tokens = sum(r.get("usage", {}).get("input_tokens", 0) for r in [*routes, *followups, *releases])
     n, m = len(ROUTE_CASES), len(RELEASE_CASES)
     print(f"\n== {name}")
     print(f"domain       {domain_ok}/{n}")
     print(f"kind         {kind_ok}/{n}")
     print(f"open_ended   {open_ok}/{n}")
+    print(f"follow-ups   {follow_ok}/{len(FOLLOWUP_CASES)}")
     print(f"same_release {release_ok}/{m}")
     print(f"latency p50 {latencies[len(latencies) // 2]:.2f}s  max {latencies[-1]:.2f}s  ({tokens} input tokens)")
     if misses:
@@ -182,8 +242,8 @@ def main():
     parser.add_argument("--refresh", action="store_true", help="ignore the cache")
     args = parser.parse_args()
     for backend in args.backends:
-        routes, releases = asyncio.run(run(backend, args.refresh))
-        report(backend, routes, releases)
+        routes, followups, releases = asyncio.run(run(backend, args.refresh))
+        report(backend, routes, followups, releases)
 
 
 if __name__ == "__main__":

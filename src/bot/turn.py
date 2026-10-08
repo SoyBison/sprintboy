@@ -153,6 +153,14 @@ def get_model() -> ChatModel:
     return _model
 
 
+def _earlier(history: list[dict]) -> list[dict]:
+    """The conversation before the latest user message."""
+    for index in range(len(history) - 1, -1, -1):
+        if history[index].get("role") == "user":
+            return history[:index]
+    return []
+
+
 def latest_user_text(history: list[dict]) -> str:
     for entry in reversed(history):
         if entry.get("role") == "user":
@@ -175,7 +183,7 @@ async def prepare(history: list[dict]) -> Turn:
     current_run_id.set(run_id)
     text = latest_user_text(history)
     try:
-        decided = await route(text, run_id=run_id)
+        decided = await route(text, run_id=run_id, earlier=_earlier(history))
     except Exception:
         logger.warning("Routing failed; using all tools", exc_info=True)
         decided = None

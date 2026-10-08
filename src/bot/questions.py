@@ -6,12 +6,21 @@ whenever the wording changes, so answers to different wordings are never mixed
 when comparing backends or building training data.
 """
 
-ROUTE_QUESTIONS_NAME = "route/v1"
+ROUTE_QUESTIONS_NAME = "route/v2"
+
+# State: {"message": latest text, "earlier": [{"from": "user"|"bot", "text": ...}]}
+# with `earlier` oldest first and absent for a fresh message. v1 saw only the
+# message, so a follow-up like "it's on Night Passage but nice try" read as
+# chat and the bot lost its download tools mid-conversation.
+_CONTEXT = (
+    " Judge `message`, the newest message; use `earlier` (the conversation so "
+    "far, oldest first) only to work out what it refers to."
+)
 
 ROUTE_QUESTIONS = {
     "domain": {
         "type": "choice",
-        "instructions": "What kind of media does the message ask for or ask about?",
+        "instructions": "What kind of media does the message ask for or ask about?" + _CONTEXT,
         "criteria": {
             "music": "albums, artists, songs, genres of music",
             "movie": "films",
@@ -21,12 +30,16 @@ ROUTE_QUESTIONS = {
     },
     "kind": {
         "type": "choice",
-        "instructions": "What kind of request is this?",
+        "instructions": "What kind of request is this?" + _CONTEXT,
         "criteria": {
-            "specific": "names particular albums, films or episodes to get",
+            "specific": (
+                "names or points at particular albums, films or episodes to get, "
+                "including correcting or retrying an earlier request ('no, the one "
+                "with track X', 'it's on Y', 'try the deluxe one')"
+            ),
             "discography": "wants an artist's complete or remaining catalogue, or their newest release",
-            "open_ended": "leaves the choice to us: recommendations, 'something like X', a genre or mood, 'surprise me'",
-            "question": "asks something or chats, no download wanted",
+            "open_ended": "leaves the choice to us: recommendations, 'something like X', a genre or mood, 'surprise me', 'more like that'",
+            "question": "asks something or chats, and wants nothing downloaded",
         },
     },
 }
