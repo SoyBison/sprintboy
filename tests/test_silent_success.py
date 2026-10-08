@@ -167,6 +167,10 @@ class TestUnfulfilledNote:
         ]
         assert "every add failed" in unfulfilled_note(messages, [])
 
+    def test_a_failed_download_albums_is_named_as_such(self):
+        messages = [_AI("", ["download_albums"]), _AI("Added it.")]
+        assert "every add failed" in unfulfilled_note(messages, [])
+
     def test_a_real_add_is_left_alone(self):
         messages = [_AI("", ["search_for_torrent", "add_torrent"]), _AI("Added it.")]
         assert unfulfilled_note(messages, ["Fly or Die [FLAC]"]) == ""
@@ -223,8 +227,79 @@ class TestAddNudge:
         messages = [_AI("", ["search_for_torrent"]), _AI("", ["add_torrent"])]
         assert not needs_add_nudge(messages, [])
 
+    def test_download_albums_counts_as_an_add(self):
+        from bot.output import needs_add_nudge
+
+        messages = [_AI("", ["search_for_torrent", "download_albums"])]
+        assert not needs_add_nudge(messages, [])
+
     def test_a_real_add_or_a_chat_is_not_nudged(self):
         from bot.output import needs_add_nudge
 
         assert not needs_add_nudge([_AI("", ["search_for_torrent"])], ["X [FLAC]"])
         assert not needs_add_nudge([_AI("", ["lastfm_artist_info"])], [])
+
+
+class TestRouteAwareNudge:
+    def _route(self, domain, kind, p=1.0):
+        from bot.routing import Route
+
+        return Route(domain, p, kind, p, None)
+
+    def test_music_download_that_never_tried_to_add_is_nudged(self):
+        from bot.output import MUSIC_NUDGE, add_nudge
+
+        messages = [_AI("", ["lastfm_artist_albums"]), _AI("Added Texas Sun.")]
+        assert add_nudge(messages, [], self._route("music", "discography")) == MUSIC_NUDGE
+
+    def test_movie_request_points_at_add_torrent(self):
+        from bot.output import VIDEO_NUDGE, add_nudge
+
+        messages = [_AI("", ["check_for_movie"]), _AI("Added Dune.")]
+        assert add_nudge(messages, [], self._route("movie", "specific")) == VIDEO_NUDGE
+
+    def test_questions_and_attempted_adds_are_left_alone(self):
+        from bot.output import add_nudge
+
+        assert add_nudge([_AI("", ["check_for_album"])], [], self._route("music", "question")) is None
+        assert add_nudge([_AI("", ["download_albums"])], [], self._route("music", "open_ended")) is None
+        assert add_nudge([_AI("", [])], ["X [FLAC]"], self._route("music", "open_ended")) is None
+
+    def test_untrusted_route_falls_back_to_the_search_rule(self):
+        from bot.output import ADD_NUDGE, add_nudge
+
+        shaky = self._route("music", "open_ended", p=0.4)
+        assert "download_albums" in add_nudge([_AI("", ["lastfm_browse_tag"])], [], shaky)
+        assert add_nudge([_AI("", ["search_for_torrent"])], [], shaky) == ADD_NUDGE
+
+
+class _Tool:
+    type = "tool"
+    tool_calls = []
+
+    def __init__(self, content):
+        self.content = content
+
+
+class TestNudgeEdgeCases:
+    def test_specific_request_they_already_own_is_not_nudged(self):
+        from bot.output import add_nudge
+        from bot.routing import Route
+
+        messages = [
+            _AI("", ["check_for_album"]),
+            _Tool("COLLISION: the user already owns 'Kind of Blue' by Miles Davis."),
+            _AI("You already own it."),
+        ]
+        assert add_nudge(messages, [], Route("music", 1.0, "specific", 1.0, None)) is None
+
+    def test_no_route_recommendation_turn_is_nudged(self):
+        from bot.output import add_nudge
+
+        messages = [_AI("", ["lastfm_browse_tag"]), _AI("Added: Distressor by Whirr")]
+        assert "download_albums" in add_nudge(messages, [], None)
+
+    def test_no_route_artist_question_is_not_nudged(self):
+        from bot.output import add_nudge
+
+        assert add_nudge([_AI("", ["lastfm_artist_info"]), _AI("Desert funk.")], [], None) is None

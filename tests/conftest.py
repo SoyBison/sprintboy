@@ -53,3 +53,17 @@ def plex_test_playlist():
             await plex.delete_playlists(await plex.find_test_playlists())
 
     asyncio.run(sweep())
+
+
+@pytest.fixture(autouse=True)
+def no_decision_backends(monkeypatch):
+    """Unit tests never reach Jev or ollaya, nor write the decision log.
+
+    Without this the developer's .env decides what check_for_album returns,
+    and every run spends Jev credits. Tests that exercise decisions patch
+    `decide` or `_same_release` themselves.
+    """
+    from bot.config import Config
+
+    monkeypatch.setattr(Config, "DECISION_PRIMARY", "off")
+    monkeypatch.setattr(Config, "DECISION_SHADOW", "off")

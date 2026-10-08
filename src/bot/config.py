@@ -71,6 +71,23 @@ class Config:
     # tools error out and check_for_album falls back to exact-name matching.
     LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
+    # Decision models: typed choice/score/yes-no questions answered with
+    # probabilities, used for routing and same-release checks. Both backends
+    # speak TypeSafe's /v1/systemone format. PRIMARY's answers drive the bot;
+    # SHADOW is asked the same thing in the background and only logged, which
+    # is what builds the comparison and distillation data. "off" disables one.
+    DECISION_PRIMARY = os.getenv("DECISION_PRIMARY", "jev").strip().lower()
+    DECISION_SHADOW = os.getenv("DECISION_SHADOW", "laya").strip().lower()
+    TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "")
+    TYPESAFE_URL = os.getenv("TYPESAFE_URL", "https://api.typesafe.ai")
+    TYPESAFE_MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
+    OLLAYA_URL = os.getenv("OLLAYA_URL", "")
+    OLLAYA_API_KEY = os.getenv("OLLAYA_API_KEY", "")
+    OLLAYA_DECISION_MODEL = os.getenv("OLLAYA_DECISION_MODEL", "laya")
+    # One JSON line per decision: state, questions, every backend's answers and
+    # latency. /app/data is the mounted volume in the container.
+    DECISION_LOG_PATH = os.getenv("DECISION_LOG_PATH", "data/decisions.jsonl")
+
     # The commit the bot is running. The Dockerfile bakes this in at build time
     # because the deployed container holds no .git to ask.
     GIT_SHA = os.getenv("GIT_SHA", "")

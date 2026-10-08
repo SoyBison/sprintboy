@@ -1,6 +1,6 @@
 # The decision-model server (Laya and friends) the bot asks typed questions of.
 # Speaks TypeSafe's /v1/systemone wire format, so the typesafe SDK talks to it
-# by setting TYPESAFE_BASE_URL=http://100.99.141.127:11435.
+# by pointing its base URL at http://100.99.141.127:11435 with OLLAYA_API_KEY.
 #
 # Lives on the unraid box at /mnt/user/appdata/ollaya/docker-compose.yml; deploy
 # with `just ollaya-deploy`. Models sit on the pool path rather than /mnt/user
@@ -16,6 +16,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OLLAYA_HOST=0.0.0.0:11435
+      # Every request must carry `Authorization: Bearer <key>`. Read from the
+      # .env beside this file on unraid, which `just ollaya-deploy` writes.
+      - OLLAYA_API_KEY=${OLLAYA_API_KEY:?set OLLAYA_API_KEY in .env}
       # qwen3:30b-a3b already holds ~23 of the 3090's 24GB, and a decision
       # model squeezing in beside it would push ollama onto the CPU the next
       # time it reloads. Laya on 24 cores is fast enough; flip to `cuda` if

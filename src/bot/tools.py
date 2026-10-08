@@ -1,4 +1,5 @@
 import asyncio
+import re
 import logging
 from typing import Union
 
@@ -15,9 +16,13 @@ from bot.netcode import (
     PLEX_CONTENT_TYPES,
     resolve_release,
 )
+from bot.decide import decide
+from bot.releases import best_versions, parse_release, quality_key
+from bot.questions import SAME_RELEASE_QUESTIONS, SAME_RELEASE_QUESTIONS_NAME
 from dataclasses import dataclass
 from pydantic import BaseModel, field_validator
 from thefuzz import fuzz, process
+from typing import Literal
 
 # Whole-title similarity at or above this means the user already owns the album.
 ALBUM_MATCH_THRESHOLD = 90
@@ -25,6 +30,9 @@ ALBUM_MATCH_THRESHOLD = 90
 # a reissue, or a different album that happens to share a prefix. The agent is
 # given these to judge rather than being told they are a collision.
 ALBUM_CONTAINED_THRESHOLD = 90
+# Decision-model probability bounds for "these two titles are the same release".
+SAME_RELEASE_YES = 0.85
+SAME_RELEASE_NO = 0.25
 # Displayed result lines per search query (all results are still stored).
 MAX_RESULTS_PER_QUERY = 25
 
@@ -56,6 +64,7 @@ class TorrentAddQuery(BaseModel):
 class TorrentSearchQuery(BaseModel):
     queries: list[str]
     category: BTCategory
+    media: Literal["CD", "SACD", "WEB", "Vinyl"] | None = None
 
     @field_validator("queries", mode="before")
     @classmethod
@@ -63,9 +72,20 @@ class TorrentSearchQuery(BaseModel):
         return _str_to_list(value)
 
 
+def _media_label(r, media: str | None) -> str:
+    if media and r.media.casefold() != media.casefold():
+        return f" (no {media} version)"
+    if r.vinyl and not media:
+        return " (vinyl only)"
+    return ""
+
+
 @tool(args_schema=TorrentSearchQuery)
 async def search_for_torrent(
-    queries: list[str], category: BTCategory, runtime: ToolRuntime[TorrentContext]
+    queries: list[str],
+    category: BTCategory,
+    runtime: ToolRuntime[TorrentContext],
+    media: str | None = None,
 ) -> str:
     """
     Perform one or more search queries on qBittorrent and return the results per query.
@@ -77,6 +97,8 @@ async def search_for_torrent(
     It is best to only include album titles and artist names in your query.
     This tool can find Movies, Music, and TV shows.
     Do not include words like "BluRay" or "720p" or "1080p" in your query.
+    Only set media when the user asks for a source (CD, SACD, WEB or Vinyl); by
+    default the best version is picked and vinyl is never chosen.
     """
     runtime.context.torrent_types.add(category)
     # qBittorrent rejects more than 5 concurrent search jobs.
@@ -108,8 +130,20 @@ async def search_for_torrent(
         # Store results in runtime for later use
         for result in outcome:
             runtime.context.search_results[result.fileName] = result
-        lines = [result.fileName for result in outcome[:MAX_RESULTS_PER_QUERY]]
-        hidden = len(outcome) - len(lines)
+        if category == BTCategory.Music:
+            names = [result.fileName for result in outcome]
+            ranked = best_versions(names, media)
+            all_lines = [
+                r.name + _media_label(r, media)
+                for r in ranked
+            ]
+            parsed = {r.name for r in ranked}
+            all_lines += [n for n in names if parse_release(n) is None and n not in parsed]
+            lines = all_lines[:MAX_RESULTS_PER_QUERY]
+            hidden = len(all_lines) - len(lines)
+        else:
+            lines = [result.fileName for result in outcome[:MAX_RESULTS_PER_QUERY]]
+            hidden = len(outcome) - len(lines)
         if hidden > 0:
             lines.append(f"({hidden} more not shown; search more specifically)")
         sections.append(f"Results for '{query}':\n" + "\n".join(lines))
@@ -265,6 +299,22 @@ def _album_scores(candidates: list[str], name: str) -> tuple[int, int]:
     return whole, contained
 
 
+async def _same_release(candidate: str, owned: str) -> float | None:
+    """Probability the two releases are the same, or None if no judgement."""
+    try:
+        decision = await decide(
+            SAME_RELEASE_QUESTIONS_NAME,
+            {"candidate": candidate, "owned": owned},
+            SAME_RELEASE_QUESTIONS,
+        )
+        if decision is None:
+            return None
+        return decision.noul("same_release")
+    except Exception as e:
+        logging.warning(f"same_release decision failed: {e}")
+        return None
+
+
 async def _check_album(artist: str, title: str | None) -> str:
     album_type = PLEX_CONTENT_TYPES["album"]
     release = await _canonicalise(artist, title)
@@ -332,10 +382,36 @@ async def _check_album(artist: str, title: str | None) -> str:
         elif contained >= ALBUM_CONTAINED_THRESHOLD:
             possibles.append((contained, name, credited))
 
+    suffix: dict[tuple[str, str], str] = {}
+    if possibles:
+        probs = await asyncio.gather(
+            *[
+                _same_release(
+                    f"{release.artist} - {release.album}", f"{credited} - {name}"
+                )
+                for _, name, credited in possibles
+            ]
+        )
+        kept: list[tuple[int, str, str]] = []
+        for entry, p in zip(possibles, probs):
+            key = (entry[1], entry[2])
+            if p is None:
+                kept.append(entry)
+            elif p >= SAME_RELEASE_YES:
+                collisions.append(entry)
+                suffix[key] = f" (judged the same release, p={p:.2f})"
+            elif p <= SAME_RELEASE_NO:
+                continue
+            else:
+                kept.append(entry)
+                suffix[key] = f" (same-release probability {p:.2f})"
+        possibles = kept
+
     if collisions:
         collisions.sort(reverse=True)
         listing = "\n".join(
-            f"- {name} by {credited}" for _, name, credited in collisions
+            f"- {name} by {credited}{suffix.get((name, credited), '')}"
+            for _, name, credited in collisions
         )
         return (
             f"{note}COLLISION: the user already owns '{release.album}' by "
@@ -345,7 +421,8 @@ async def _check_album(artist: str, title: str | None) -> str:
     if possibles:
         possibles.sort(reverse=True)
         listing = "\n".join(
-            f"- {name} by {credited}" for _, name, credited in possibles
+            f"- {name} by {credited}{suffix.get((name, credited), '')}"
+            for _, name, credited in possibles
         )
         return (
             f"{note}The user does not have an exact match for '{release.album}' by "
@@ -516,6 +593,20 @@ async def _library_albums(plex, artist: str) -> list[str] | None:
         return None
 
 
+def _maybe_title(owned: list[str] | None, album: str) -> str | None:
+    """The owned title that is a maybe for album (None if exact, none or failed)."""
+    if owned is None:
+        return None
+    maybe = None
+    for title in owned:
+        whole, contained = _album_scores([album], title)
+        if whole >= ALBUM_MATCH_THRESHOLD:
+            return None
+        if maybe is None and contained >= ALBUM_CONTAINED_THRESHOLD:
+            maybe = title
+    return maybe
+
+
 def _ownership(owned: list[str] | None, album: str) -> str:
     if owned is None:
         return " [library check failed]"
@@ -527,6 +618,29 @@ def _ownership(owned: list[str] | None, album: str) -> str:
         if maybe is None and contained >= ALBUM_CONTAINED_THRESHOLD:
             maybe = title
     return f" [maybe owned as '{maybe}']" if maybe is not None else ""
+
+
+async def _resolve_maybes(
+    artist: str, albums: list[str], owned: list[str] | None
+) -> dict[str, str]:
+    """Final ownership mark per album, asking the model only for maybes."""
+    marks = {album: _ownership(owned, album) for album in albums}
+    pending = [a for a, m in marks.items() if m.startswith(" [maybe owned as '")]
+    titles = {a: _maybe_title(owned, a) for a in pending}
+    probs = await asyncio.gather(
+        *[
+            _same_release(f"{artist} - {a}", f"{artist} - {titles[a]}")
+            for a in pending
+        ]
+    )
+    for album, p in zip(pending, probs):
+        if p is None:
+            continue
+        if p >= SAME_RELEASE_YES:
+            marks[album] = " [OWNED]"
+        elif p <= SAME_RELEASE_NO:
+            marks[album] = ""
+    return marks
 
 
 def _artist_ownership(owned: list[str] | None) -> str:
@@ -602,13 +716,14 @@ async def _artist_albums_section(artist: str, limit: int) -> str:
         return f"Last.fm has no albums listed for {artist}."
     resolved = albums[0].artist or artist
     owned = (await _library_lookup([resolved]))[resolved]
+    marks = await _resolve_maybes(resolved, [a.name for a in albums], owned)
     listing = "\n".join(
         f"- {album.name}"
         + (f" ({album.playcount:,} plays)" if album.playcount else "")
-        + _ownership(owned, album.name)
+        + marks[album.name]
         for album in albums
     )
-    new = sum(1 for album in albums if _ownership(owned, album.name) == "")
+    new = sum(1 for album in albums if marks[album.name] == "")
     return (
         f"Albums by {resolved} on Last.fm, most played first:\n{listing}\n"
         f"{new} of these are not in the library."
@@ -668,13 +783,24 @@ async def lastfm_browse_tag(tag: str, limit: int = 30) -> str:
             )
         )
     if albums:
+        by_artist: dict[str, list[str]] = {}
+        for album in albums:
+            if album.artist:
+                by_artist.setdefault(album.artist, []).append(album.name)
+        resolved = await asyncio.gather(
+            *[
+                _resolve_maybes(a, names, owned.get(a))
+                for a, names in by_artist.items()
+            ]
+        )
+        marks = dict(zip(by_artist, resolved))
         sections.append(
             f"Top albums tagged '{tag}':\n"
             + "\n".join(
                 f"- {album.name}"
                 + (f" by {album.artist}" if album.artist else "")
                 + (
-                    _ownership(owned.get(album.artist), album.name)
+                    marks[album.artist][album.name]
                     if album.artist
                     else ""
                 )
@@ -703,4 +829,108 @@ async def lastfm_resolve(artist: str, album: str | None = None) -> str:
     if release.album_mbid:
         lines.append(f"Album MusicBrainz id: {release.album_mbid}")
     lines.append(f"Use this for torrent searches: {release.artist} {release.album or ''}".strip())
+    return "\n".join(lines)
+
+
+class DownloadAlbumsQuery(BaseModel):
+    albums: list[AlbumRef]
+    media: Literal["CD", "SACD", "WEB", "Vinyl"] | None = None
+
+
+_EDITION_WORDS = {
+    "deluxe", "edition", "expanded", "remaster", "remastered", "anniversary",
+    "bonus", "version", "special", "complete", "reissue", "collectors",
+    "collector's", "super", "anniv", "th", "the",
+}
+_WORD = re.compile(r"[a-z0-9']+")
+
+
+def _title_matches(wanted: str, found: str) -> bool:
+    """Whether a torrent's title is the album asked for, or an edition of it.
+
+    "Mordechai" contains in "Mordechai Remixes" too, and a remix album is not
+    what was asked for, so extra words only pass when they are edition words
+    ("Deluxe Edition", "2017 Remaster").
+    """
+    a, b = wanted.casefold(), found.casefold()
+    if re.sub(r"[\W_]+", "", a) == re.sub(r"[\W_]+", "", b):
+        return True
+    want = set(_WORD.findall(a))
+    extra = {w for w in set(_WORD.findall(b)) - want if not w.isdigit()}
+    # "The Universe Smiles Upon You ii" is a different album however close.
+    if not want or not extra <= _EDITION_WORDS:
+        return False
+    return fuzz.token_set_ratio(a, b) >= 90
+
+
+@tool(args_schema=DownloadAlbumsQuery)
+async def download_albums(
+    albums: list[AlbumRef],
+    runtime: ToolRuntime[TorrentContext],
+    media: str | None = None,
+) -> str:
+    """Get albums in one step: checks the library, searches, picks the best version (SACD and perfect CD rips first, never vinyl unless asked; set media only when the user asks for CD, SACD, WEB or Vinyl) and adds it. Pass every album you chose in one call, using Last.fm spellings. Only items reported as 'Added' are downloading."""
+    context = runtime.context
+    context.torrent_types.add(BTCategory.Music)
+    refs = [AlbumRef.model_validate(a) if isinstance(a, dict) else a for a in albums]
+    semaphore = asyncio.Semaphore(3)
+    claimed: set[str] = set()
+
+    async def _one(ref: AlbumRef) -> str:
+        artist, title = ref.artist, ref.title
+        label = f"'{artist} - {title}'"
+        owned = await _check_album(artist, title)
+        if "COLLISION:" in owned:
+            return f"OWNED: {label} is already in the library; skipped."
+
+        async with semaphore:
+            async with QBittorrentClient() as qclient:
+                response = await qclient.search(f"{artist} {title}", BTCategory.Music)
+        found = [r for r in (response.results or []) if "FLAC" in r.fileName]
+        for result in found:
+            context.search_results[result.fileName] = result
+        names = [r.fileName for r in found]
+
+        ranked = best_versions(names, media)
+        matches = [
+            r
+            for r in ranked
+            if _title_matches(title, r.title)
+            and fuzz.partial_ratio(artist.casefold(), r.artist.casefold()) >= 90
+        ]
+        if not matches:
+            line = f"NOT FOUND: no FLAC torrent for {label}."
+            if ranked:
+                line += " Closest results: " + "; ".join(r.name for r in ranked[:3])
+            return line
+        best = max(
+            matches,
+            key=lambda r: (
+                r.kind == "Album",
+                fuzz.ratio(title.casefold(), r.title.casefold()),
+                quality_key(r, media),
+            ),
+        )
+        if media and best.media.casefold() != media.casefold():
+            return (
+                f"NOT ADDED: there is no {media} version of {label}. Best available: "
+                f"{best.name}. Ask again without a media preference to get it."
+            )
+        if best.vinyl and not media:
+            return (
+                f"NOT ADDED: only a vinyl rip of {label} exists ({best.name}). "
+                f"Ask for vinyl to get it."
+            )
+        if best.name in claimed:
+            return "NOT ADDED: duplicate of an earlier album in this call."
+        claimed.add(best.name)
+        return await _add_one(best.name, BTCategory.Music, context, corrected_name=best.name)
+
+    outcomes = await asyncio.gather(*[_one(r) for r in refs], return_exceptions=True)
+    lines = []
+    for ref, outcome in zip(refs, outcomes):
+        if isinstance(outcome, BaseException):
+            logging.warning(f"download_albums for {ref} failed: {outcome}")
+            outcome = f"NOT ADDED: '{ref.artist} - {ref.title}' failed: {outcome}"
+        lines.append(outcome)
     return "\n".join(lines)

@@ -1,8 +1,6 @@
 import asyncio
 import logging
 
-from langchain.agents import create_agent
-from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from bot.netcode import (
@@ -12,25 +10,14 @@ from bot.netcode import (
     TorrentInfoResponse,
 )
 
-from bot.tools import (
-    check_albums,
-    check_for_album,
-    check_for_movie,
-    lastfm_artist_albums,
-    lastfm_artist_info,
-    lastfm_browse_tag,
-    lastfm_resolve,
-    lastfm_similar_artists,
-    search_for_torrent,
-    add_torrent,
-    TorrentContext,
-)
+from bot.tools import TorrentContext
+from bot import turn
+from bot.turn import SYSTEM_PROMPT, AGENT_TOOLS, build_llm  # noqa: F401
 from bot.output import (
     best_reply,
-    ADD_NUDGE,
     describe_failure,
     name_list,
-    needs_add_nudge,
+    add_nudge,
     split_for_discord,
     summarise_run,
     unfulfilled_note,
@@ -54,135 +41,9 @@ MAX_HISTORY_DEPTH = 20
 # How many conversations we keep torrent context for.
 MAX_TRACKED_CONVERSATIONS = 50
 
-SYSTEM_PROMPT = """
-You add music, movies and TV to the user's Plex server by finding torrents through qBittorrent.
-First work out whether they want music, a movie, or a TV show, and use the tools for that kind of media.
-
-Before doing anything, decide which kind of request this is:
-    A. SPECIFIC: named albums, "the new X album", "X's discography", "fill in my X collection".
-       The user wants exactly those releases. Never download anything they already own; if
-       they own all of it, adding nothing is the correct result, so say so.
-    B. OPEN-ENDED: "5 albums like X", "something new", "some shoegaze", "surprise me",
-       "more by X". The user wants NEW music. Albums they already own do not count towards
-       what they asked for: skip them silently and pick something else. Keep going until you
-       have added the number they asked for (3 if they gave no number). Only stop short if you
-       have genuinely run out of candidates, and say how many you managed.
-
-For music:
-    1. Find real candidates with Last.fm. Never rely on your own memory of discographies,
-       album titles or similar artists: it is stale and you will invent releases.
-       - lastfm_artist_albums for real releases (pass several artists in one call)
-       - lastfm_similar_artists and lastfm_browse_tag for recommendations and styles
-       - lastfm_artist_info to learn what an artist sounds like and which tags to follow
-       - lastfm_resolve to turn a vague or misspelled name into the real release name
-       These results are marked [OWNED], [maybe owned as ...], [in library: N albums] or
-       [new to you]. Trust the marks: drop [OWNED] albums, and for open-ended requests prefer
-       artists marked [new to you]. For open-ended requests, gather about twice as many
-       candidates as you need so that owned or unavailable ones can be replaced.
-    2. For a SPECIFIC request, check every album you are about to search for in ONE
-       check_albums call (it catches aliases and editions the marks can miss). For an
-       open-ended request the marks are enough; only check albums that came from elsewhere.
-       Never call check_albums or check_for_album once per album.
-       A COLLISION means they own it: drop it. A possible match means decide yourself whether it is the same release.
-    3. Search for ALL remaining candidates in ONE search_for_torrent call, one query per
-       album, as "Artist Album" using the Last.fm spelling.
-    4. Add every torrent you picked in ONE add_torrent call, using the names exactly as the
-       search returned them.
-    5. For an open-ended request, if some candidates had no torrent or failed to add, repeat
-       steps 3-4 with the next candidates until you reach the count. Do not stop after one.
-
-Rules:
-    - Do not ask follow up questions. Make a reasonable choice and act on it.
-    - Always use the batch form of tools (several albums per call) instead of one call per
-      album. It is much faster.
-    - Searching is not downloading. Never say you added, downloaded or grabbed something
-      unless add_torrent answered "Added" for it. If it answered "NOT ADDED", say plainly
-      that it is not downloading and why.
-    - Prefer higher quality (24bit over 16bit, lossless over lossy), and only choose a vinyl
-      rip if the user specifically asks for one.
-    - If two torrents are the same album but one is a special or deluxe release, get only the
-      special release. Never download the same album twice in two formats.
-    - Prefer full studio albums over EPs, singles, live records and compilations unless asked.
-    - For open-ended requests, spread picks across different artists (at most two albums per
-      artist) unless they asked for more by one artist.
-    - If a Last.fm tool errors, say so and carry on with the torrent search, but do not
-      substitute guessed album names for ones you could not verify.
-
-Your reply is posted straight into a Discord chat, so:
-    - Always finish with a reply. Never stop after a tool call without saying what happened.
-    - Write it to the person who asked, as "you", and never refer to them as "the user".
-    - List what you added. For specific requests, also name what you skipped because they
-      already had it. For open-ended requests, do not list owned albums you passed over.
-      If you added nothing, say why in one line.
-    - No preamble, no restating the request, no notes about your own process, tool names or
-      reasoning, and no lists of steps you are about to take.
-    - Keep it short: a sentence or two, plus a list of album names if there is one.
-"""
-
 # Keyed by the id of the message that started a conversation, so that a reply
 # chain keeps the search results and downloads it has accumulated so far.
 conversation_contexts: dict[int, TorrentContext] = {}
-
-_agent = None
-
-
-def build_llm():
-    """Build the chat model for the configured backend.
-
-    Imported lazily so that running on one backend does not require the other's
-    package to be installed or its credentials to be present.
-    """
-    Config.validate_llm()
-    if Config.LLM_PROVIDER == "ollama":
-        from langchain_ollama import ChatOllama
-
-        logger.info(
-            f"Using ollama model {Config.OLLAMA_MODEL} at {Config.OLLAMA_API_URL}"
-        )
-        return ChatOllama(
-            model=Config.OLLAMA_MODEL,
-            base_url=Config.OLLAMA_API_URL,
-            num_ctx=Config.OLLAMA_NUM_CTX,
-            # The agent picks between concrete torrents and album titles, so a
-            # creative model just invents releases that were not in the results.
-            temperature=0,
-            # Fail at startup with a clear message rather than on the first
-            # message with a 404 from a model that was never pulled.
-            validate_model_on_init=Config.OLLAMA_VALIDATE_MODEL,
-        )
-
-    from langchain_anthropic import ChatAnthropic
-
-    logger.info(f"Using anthropic model {Config.ANTHROPIC_MODEL}")
-    return ChatAnthropic(model_name=Config.ANTHROPIC_MODEL)  # type: ignore
-
-
-AGENT_TOOLS = [
-    search_for_torrent,
-    add_torrent,
-    check_albums,
-    check_for_album,
-    check_for_movie,
-    lastfm_artist_info,
-    lastfm_similar_artists,
-    lastfm_artist_albums,
-    lastfm_browse_tag,
-    lastfm_resolve,
-]
-
-
-def get_agent():
-    """Build the agent once and reuse it across messages."""
-    global _agent
-    if _agent is None:
-        load_dotenv()
-        _agent = create_agent(
-            build_llm(),
-            tools=AGENT_TOOLS,
-            context_schema=TorrentContext,
-        )
-    return _agent
-
 
 def get_conversation_context(root_id: int) -> TorrentContext:
     context = conversation_contexts.get(root_id)
@@ -338,21 +199,28 @@ async def on_message(message: discord.Message):
     history, root_id = await build_conversation(message)
     torrent_context = get_conversation_context(root_id)
     known_torrents = set(torrent_context.internal_torrents)
-    logger.info(f"Handling message {message.id} in conversation {root_id}")
+    run_id = None
 
     async with message.channel.typing():
         try:
-            response = await get_agent().ainvoke(
-                {"messages": [{"role": "system", "content": SYSTEM_PROMPT}, *history]},
+            agent, messages, route, run_id = await turn.prepare(history)
+            logger.info(
+                f"Handling message {message.id} in conversation {root_id} run {run_id}"
+            )
+            response = await agent.ainvoke(
+                {"messages": messages},
                 context=torrent_context,
             )
-            if needs_add_nudge(response["messages"], _new(torrent_context, known_torrents)):
-                logger.info("Turn searched but added nothing; nudging once")
-                response = await get_agent().ainvoke(
+            nudge = add_nudge(
+                response["messages"], _new(torrent_context, known_torrents), route
+            )
+            if nudge:
+                logger.info(f"Run {run_id}: download turn added nothing; nudging once")
+                response = await agent.ainvoke(
                     {
                         "messages": [
                             *response["messages"],
-                            {"role": "user", "content": ADD_NUDGE},
+                            {"role": "user", "content": nudge},
                         ]
                     },
                     context=torrent_context,
@@ -362,7 +230,7 @@ async def on_message(message: discord.Message):
             await reply_in_chunks(message, describe_failure(e))
             return
 
-    logger.info(summarise_run(response["messages"]))
+    logger.info(f"Run {run_id}: {summarise_run(response['messages'])}")
     new_torrents = _new(torrent_context, known_torrents)
     reply = best_reply(response["messages"], new_torrents)
     note = unfulfilled_note(response["messages"], new_torrents)

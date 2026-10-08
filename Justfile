@@ -43,6 +43,7 @@ ollama-logs:
 ollaya-deploy:
     tailscale ssh root@shiitake "mkdir -p /mnt/user/appdata/ollaya /mnt/mycelium/appdata/ollaya && chown 1000:1000 /mnt/mycelium/appdata/ollaya"
     cat docker-compose.ollaya.yml | tailscale ssh root@shiitake "cat > /mnt/user/appdata/ollaya/docker-compose.yml"
+    echo "OLLAYA_API_KEY=$OLLAYA_API_KEY" | tailscale ssh root@shiitake "umask 077 && cat > /mnt/user/appdata/ollaya/.env"
     tailscale ssh root@shiitake "cd /mnt/user/appdata/ollaya && docker compose pull && docker compose up -d"
 
 # Pull a decision model onto the server, e.g. `just ollaya-pull laya`
@@ -71,7 +72,9 @@ deploy: build
     tailscale ssh root@shiitake "docker load --input /tmp/sprintboy.tar.gz"
 
     rm /tmp/sprintboy.tar.gz
-    echo "Deployment complete! Go to Unraid to Update"
+    echo "Recreating the container on the new image..."
+    tailscale ssh root@shiitake "cd /mnt/user/appdata/sprintboy && docker compose up -d && docker image prune -f"
+    echo "Deployment complete!"
 
 # Deploy without rebuilding (faster for quick iterations)
 deploy-quick:

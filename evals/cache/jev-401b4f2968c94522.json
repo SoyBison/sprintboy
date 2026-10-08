@@ -1,0 +1,14 @@
+{
+ "model": "jev-1.13.0",
+ "answers": {
+  "same_release": {
+   "type": "noul",
+   "noul": 0.96
+  }
+ },
+ "usage": {
+  "input_tokens": 370,
+  "output_tokens": 21
+ },
+ "_latency": 0.13073413699748926
+}

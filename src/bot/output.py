@@ -133,6 +133,7 @@ def best_reply(messages, new_torrents: list[str] | None = None) -> str:
 _MEDIA_TOOLS = (
     "search_for_torrent",
     "add_torrent",
+    "download_albums",
     "check_for_album",
     "check_for_movie",
 )
@@ -155,17 +156,68 @@ ADD_NUDGE = (
     "nothing suitable was found, or everything is already owned, just say so."
 )
 
+MUSIC_NUDGE = (
+    "You have not called download_albums, so nothing is downloading. Call it now, "
+    "once, with every album you chose. If everything they asked for is already "
+    "owned, just say so."
+)
 
-def needs_add_nudge(messages, new_torrents: list[str] | None) -> bool:
-    """True when a turn searched for torrents and then stopped without adding any.
+VIDEO_NUDGE = (
+    "You have not called add_torrent, so nothing is downloading. Search with "
+    "search_for_torrent if you have not, then add what you chose in one add_torrent "
+    "call. If they already own it or nothing was found, just say so."
+)
 
-    Small models routinely end with "Added: ..." straight after the search, so one
-    extra prompt is far cheaper than the person asking again.
+_ADD_TOOLS = {"add_torrent", "download_albums"}
+_DOWNLOAD_KINDS = {"specific", "discography", "open_ended"}
+_RECOMMENDATION_TOOLS = {"lastfm_similar_artists", "lastfm_browse_tag", "check_albums"}
+
+
+def _tool_text(messages) -> str:
+    """Everything the tools answered this turn."""
+    return "\n".join(
+        str(getattr(m, "content", ""))
+        for m in messages
+        if getattr(m, "type", None) == "tool"
+    )
+
+
+def add_nudge(messages, new_torrents: list[str] | None, route=None) -> str | None:
+    """The one follow-up to send when a download turn ended without trying to add.
+
+    Small models routinely reply "Added: ..." having called nothing but the
+    Last.fm or library tools, so for a request the router says wants a download,
+    one extra prompt is far cheaper than the person asking again. A turn that
+    tried an add and failed (dry run, dead indexer) is left alone: retrying
+    would only fail again.
     """
     if new_torrents:
-        return False
-    called = tool_names(messages)
-    return "search_for_torrent" in called and "add_torrent" not in called
+        return None
+    called = set(tool_names(messages))
+    if called & _ADD_TOOLS:
+        return None
+    if route is not None and route.trusted:
+        if route.kind not in _DOWNLOAD_KINDS:
+            return None
+        # "Get me X" when they own X: saying so is the whole answer.
+        if route.kind == "specific" and "COLLISION" in _tool_text(messages):
+            return None
+        if route.domain == "music":
+            return MUSIC_NUDGE
+        if route.domain in ("movie", "tv"):
+            return VIDEO_NUDGE
+    # No trusted route (the router was down or unsure): nudge on the signs that
+    # only download turns show, a search or a recommendation lookup.
+    if "search_for_torrent" in called:
+        return ADD_NUDGE
+    if called & _RECOMMENDATION_TOOLS:
+        return MUSIC_NUDGE + " If they only asked a question, just answer it."
+    return None
+
+
+def needs_add_nudge(messages, new_torrents: list[str] | None) -> bool:
+    """Route-less form of add_nudge, kept for callers that only need yes/no."""
+    return add_nudge(messages, new_torrents) is not None
 
 
 def unfulfilled_note(messages, new_torrents: list[str] | None) -> str:
@@ -182,7 +234,7 @@ def unfulfilled_note(messages, new_torrents: list[str] | None) -> str:
     called = set(tool_names(messages))
     if not called.intersection(_MEDIA_TOOLS):
         return ""
-    if "add_torrent" in called:
+    if called.intersection({"add_torrent", "download_albums"}):
         return (
             "Nothing reached qBittorrent this turn: every add failed. Ignore any "
             "claim above that something is downloading, and ask me again."

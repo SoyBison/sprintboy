@@ -40,10 +40,9 @@ async def _ask(
             Config.ANTHROPIC_MODEL = model
 
     # Imported here so that --provider is applied before the model is built.
-    from bot.main import SYSTEM_PROMPT, AGENT_TOOLS, build_llm
-    from langchain.agents import create_agent
+    from bot import turn
+    from bot.decide import drain_shadow
 
-    agent = create_agent(build_llm(), tools=AGENT_TOOLS, context_schema=TorrentContext)
     context = TorrentContext(
         search_results={}, internal_torrents={}, torrent_types=set()
     )
@@ -55,19 +54,30 @@ async def _ask(
             fg="cyan",
         )
     )
-    from bot.output import ADD_NUDGE, needs_add_nudge
+    from bot.output import add_nudge
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": query},
-    ]
+    agent, messages, route, _run_id = await turn.prepare(
+        [{"role": "user", "content": query}]
+    )
+    if route is None:
+        click.echo(click.style("route: none", fg="cyan"))
+    else:
+        tools = [t.name for t in turn.select_tools(route)]
+        click.echo(
+            click.style(
+                f"route: {route.domain}/{route.kind} "
+                f"({route.domain_p:.2f}/{route.kind_p:.2f}) "
+                f"count={route.count} tools={tools}",
+                fg="cyan",
+            )
+        )
     messages = await _stream(agent, messages, context)
     # Same single retry the Discord bot makes for a search that was never added.
-    if needs_add_nudge(messages, list(context.internal_torrents)):
-        click.echo(click.style("  (nudging: searched but never added)", fg="magenta"))
-        await _stream(
-            agent, [*messages, {"role": "user", "content": ADD_NUDGE}], context
-        )
+    nudge = add_nudge(messages, list(context.internal_torrents), route)
+    if nudge:
+        click.echo(click.style("  (nudging: download turn added nothing)", fg="magenta"))
+        await _stream(agent, [*messages, {"role": "user", "content": nudge}], context)
+    await drain_shadow()
 
 
 async def _stream(agent, messages, context) -> list:

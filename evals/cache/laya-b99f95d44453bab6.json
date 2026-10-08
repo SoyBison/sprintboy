@@ -1,0 +1,14 @@
+{
+ "model": "laya:en",
+ "answers": {
+  "same_release": {
+   "type": "noul",
+   "noul": 0.8805
+  }
+ },
+ "usage": {
+  "input_tokens": 116,
+  "output_tokens": 0
+ },
+ "_latency": 0.15352417500253068
+}
