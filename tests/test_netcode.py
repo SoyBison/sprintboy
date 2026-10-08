@@ -297,7 +297,7 @@ class TestPlexAPIClient:
             assert len(results["MediaContainer"]["Metadata"]) > 0
 
     @pytest.mark.asyncio
-    async def test_make_playlist(self):
+    async def test_make_playlist(self, plex_test_playlist):
         async with PlexAPIClient() as client:
             # first get rapp snitch knishes by mf doom
             results = await client.get_all_library_items(
@@ -310,5 +310,5 @@ class TestPlexAPIClient:
             logging.debug(json.dumps(results, indent=2))
             song_id = results["MediaContainer"]["Metadata"][0]["key"]
             logging.debug(song_id)
-            await client.create_playlist("Rapp Snitch Knishes", song_id)
-            print("✓ Playlist created successfully")
+            await client.create_playlist(plex_test_playlist, song_id)
+            print(f"✓ Playlist {plex_test_playlist} created successfully")

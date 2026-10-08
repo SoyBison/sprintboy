@@ -1,0 +1,30 @@
+# The decision-model server (Laya and friends) the bot asks typed questions of.
+# Speaks TypeSafe's /v1/systemone wire format, so the typesafe SDK talks to it
+# by setting TYPESAFE_BASE_URL=http://100.99.141.127:11435.
+#
+# Lives on the unraid box at /mnt/user/appdata/ollaya/docker-compose.yml; deploy
+# with `just ollaya-deploy`. Models sit on the pool path rather than /mnt/user
+# for the same reason as ollama's: the fuse share makes loading slow.
+services:
+  ollaya:
+    # The CUDA build, so moving to the GPU is a one-line change. Driver 590 on
+    # the box is new enough for the CUDA 13 image.
+    image: ghcr.io/ollaya-dev/ollaya:cuda
+    container_name: ollaya
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAYA_HOST=0.0.0.0:11435
+      # qwen3:30b-a3b already holds ~23 of the 3090's 24GB, and a decision
+      # model squeezing in beside it would push ollama onto the CPU the next
+      # time it reloads. Laya on 24 cores is fast enough; flip to `cuda` if
+      # the chat model ever shrinks.
+      - OLLAYA_DEVICE=cpu
+      # The bot asks a handful of questions per message, minutes apart.
+      - OLLAYA_KEEP_ALIVE=60m
+    volumes:
+      - /mnt/mycelium/appdata/ollaya:/home/ollaya/.ollaya
+    ports:
+      - '11435:11435'
+    restart: unless-stopped

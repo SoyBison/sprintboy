@@ -13,6 +13,7 @@ from bot.netcode import (
 )
 
 from bot.tools import (
+    check_albums,
     check_for_album,
     check_for_movie,
     lastfm_artist_albums,
@@ -26,12 +27,15 @@ from bot.tools import (
 )
 from bot.output import (
     best_reply,
+    ADD_NUDGE,
     describe_failure,
     name_list,
+    needs_add_nudge,
     split_for_discord,
     summarise_run,
+    unfulfilled_note,
 )
-from bot.config import Config, setup_logging
+from bot.config import Config, git_sha, setup_logging
 
 # Honour LOG_LEVEL: this was pinned to DEBUG, which made the deployed logs
 # unreadable and rolled the container's 50m of history in minutes.
@@ -51,44 +55,68 @@ MAX_HISTORY_DEPTH = 20
 MAX_TRACKED_CONVERSATIONS = 50
 
 SYSTEM_PROMPT = """
-You are a helpful assistant that adds music, movies and TV to the user's Plex server by
-searching for torrents in qBittorrent.
-First work out whether the user wants music, a movie, or a TV show, and use the tools for that kind of media.
+You add music, movies and TV to the user's Plex server by finding torrents through qBittorrent.
+First work out whether they want music, a movie, or a TV show, and use the tools for that kind of media.
 
-For music, follow this order:
-    1. Establish what actually exists using the Last.fm tools. Do not rely on your own
-       recollection of an artist's discography, album titles or which artists sound alike:
-       your training data is stale and you will invent releases that were never made.
-       - lastfm_artist_albums for an artist's real releases and their real spellings
+Before doing anything, decide which kind of request this is:
+    A. SPECIFIC: named albums, "the new X album", "X's discography", "fill in my X collection".
+       The user wants exactly those releases. Never download anything they already own; if
+       they own all of it, adding nothing is the correct result, so say so.
+    B. OPEN-ENDED: "5 albums like X", "something new", "some shoegaze", "surprise me",
+       "more by X". The user wants NEW music. Albums they already own do not count towards
+       what they asked for: skip them silently and pick something else. Keep going until you
+       have added the number they asked for (3 if they gave no number). Only stop short if you
+       have genuinely run out of candidates, and say how many you managed.
+
+For music:
+    1. Find real candidates with Last.fm. Never rely on your own memory of discographies,
+       album titles or similar artists: it is stale and you will invent releases.
+       - lastfm_artist_albums for real releases (pass several artists in one call)
        - lastfm_similar_artists and lastfm_browse_tag for recommendations and styles
        - lastfm_artist_info to learn what an artist sounds like and which tags to follow
        - lastfm_resolve to turn a vague or misspelled name into the real release name
-    2. Call check_for_album for every album you are considering. It canonicalises the
-       names through Last.fm and fuzzy matches the whole library, so trust its answer:
-       if it reports a COLLISION, drop that album and say so. If it reports a possible
-       match, decide for yourself whether it is the same release.
-    3. Search for the remaining albums with search_for_torrent, using the Last.fm
-       spelling of the artist and album.
-    4. Add the ones you picked with add_torrent, then summarise concisely what you added
-       and what you skipped because the user already had it.
+       These results are marked [OWNED], [maybe owned as ...], [in library: N albums] or
+       [new to you]. Trust the marks: drop [OWNED] albums, and for open-ended requests prefer
+       artists marked [new to you]. For open-ended requests, gather about twice as many
+       candidates as you need so that owned or unavailable ones can be replaced.
+    2. For a SPECIFIC request, check every album you are about to search for in ONE
+       check_albums call (it catches aliases and editions the marks can miss). For an
+       open-ended request the marks are enough; only check albums that came from elsewhere.
+       Never call check_albums or check_for_album once per album.
+       A COLLISION means they own it: drop it. A possible match means decide yourself whether it is the same release.
+    3. Search for ALL remaining candidates in ONE search_for_torrent call, one query per
+       album, as "Artist Album" using the Last.fm spelling.
+    4. Add every torrent you picked in ONE add_torrent call, using the names exactly as the
+       search returned them.
+    5. For an open-ended request, if some candidates had no torrent or failed to add, repeat
+       steps 3-4 with the next candidates until you reach the count. Do not stop after one.
 
-Some rules:
-    - Do not ask follow up questions. Assume the user wants all torrents available.
-    - Prefer higher quality, and only choose a vinyl rip if the user specifically requests it.
-    - If two torrents are similar enough that they may be the same album but one is a special release, only get the special release.
-    - Do not ever download the same album in two formats.
-    - If a Last.fm tool errors, say so and carry on with the torrent search rather than
-      giving up, but do not substitute guessed album names for the ones you could not verify.
+Rules:
+    - Do not ask follow up questions. Make a reasonable choice and act on it.
+    - Always use the batch form of tools (several albums per call) instead of one call per
+      album. It is much faster.
+    - Searching is not downloading. Never say you added, downloaded or grabbed something
+      unless add_torrent answered "Added" for it. If it answered "NOT ADDED", say plainly
+      that it is not downloading and why.
+    - Prefer higher quality (24bit over 16bit, lossless over lossy), and only choose a vinyl
+      rip if the user specifically asks for one.
+    - If two torrents are the same album but one is a special or deluxe release, get only the
+      special release. Never download the same album twice in two formats.
+    - Prefer full studio albums over EPs, singles, live records and compilations unless asked.
+    - For open-ended requests, spread picks across different artists (at most two albums per
+      artist) unless they asked for more by one artist.
+    - If a Last.fm tool errors, say so and carry on with the torrent search, but do not
+      substitute guessed album names for ones you could not verify.
 
 Your reply is posted straight into a Discord chat, so:
     - Always finish with a reply. Never stop after a tool call without saying what happened.
     - Write it to the person who asked, as "you", and never refer to them as "the user".
-    - Say what you added and what you skipped, naming the albums. If you added nothing, say
-      why in one line.
+    - List what you added. For specific requests, also name what you skipped because they
+      already had it. For open-ended requests, do not list owned albums you passed over.
+      If you added nothing, say why in one line.
     - No preamble, no restating the request, no notes about your own process, tool names or
       reasoning, and no lists of steps you are about to take.
-    - Keep it short: a sentence or two, plus a list of album names if there is one. Leave out
-      any list that would be empty.
+    - Keep it short: a sentence or two, plus a list of album names if there is one.
 """
 
 # Keyed by the id of the message that started a conversation, so that a reply
@@ -132,6 +160,7 @@ def build_llm():
 AGENT_TOOLS = [
     search_for_torrent,
     add_torrent,
+    check_albums,
     check_for_album,
     check_for_movie,
     lastfm_artist_info,
@@ -221,13 +250,19 @@ async def wait_for_downloads(
     """Poll qBittorrent until the newly added torrents finish, then sync Plex."""
     torrent_sync_targets: dict[str, BTCategory] = {}
     torrent_info: list[TorrentInfoResponse] = []
+    waiting_on = [
+        name for name in new_torrents if torrent_context.internal_torrents.get(name)
+    ]
+    if not waiting_on:
+        # `all([])` is True, so without this an empty poll would fall straight
+        # through to announcing a finished download that never started.
+        logger.warning(f"Nothing to wait for out of {new_torrents}")
+        return
     while True:
         async with QBittorrentClient() as qclient:
             torrent_info_promises = []
-            for name in new_torrents:
-                memory_code = torrent_context.internal_torrents.get(name)
-                if memory_code is None:
-                    continue
+            for name in waiting_on:
+                memory_code = torrent_context.internal_torrents[name]
                 torrent_info_promises.append(qclient.get_torrent_info(memory_code))
             torrent_info = await asyncio.gather(*torrent_info_promises)
             logger.info(f"Torrent info: {torrent_info}")
@@ -251,13 +286,15 @@ async def wait_for_downloads(
     await reply_in_chunks(
         message,
         f"Finished downloading, and Plex has been told to scan:\n"
-        f"{name_list(new_torrents)}",
+        f"{name_list(waiting_on)}",
     )
 
 
 @bot.event
 async def on_ready():
-    logger.info(f"{bot.user} is running in {Config.ENVIRONMENT} mode")
+    logger.info(
+        f"{bot.user} is running in {Config.ENVIRONMENT} mode on commit {git_sha()}"
+    )
     logger.info(f"Bot is in {len(bot.guilds)} guilds")
 
     # Sync slash commands with Discord
@@ -274,8 +311,13 @@ async def on_ready():
 async def ping(interaction: discord.Interaction):
     logger.info("Received ping command")
     await interaction.response.send_message(
-        f"Pong! Running in {Config.ENVIRONMENT} mode"
+        f"Pong! Running in {Config.ENVIRONMENT} mode on commit `{git_sha()}`"
     )
+
+
+def _new(context: TorrentContext, known: set[str]) -> list[str]:
+    """Torrents added since `known` was snapshotted."""
+    return [name for name in context.internal_torrents if name not in known]
 
 
 @bot.event
@@ -304,21 +346,43 @@ async def on_message(message: discord.Message):
                 {"messages": [{"role": "system", "content": SYSTEM_PROMPT}, *history]},
                 context=torrent_context,
             )
+            if needs_add_nudge(response["messages"], _new(torrent_context, known_torrents)):
+                logger.info("Turn searched but added nothing; nudging once")
+                response = await get_agent().ainvoke(
+                    {
+                        "messages": [
+                            *response["messages"],
+                            {"role": "user", "content": ADD_NUDGE},
+                        ]
+                    },
+                    context=torrent_context,
+                )
         except Exception as e:
             logger.exception("Agent invocation failed")
             await reply_in_chunks(message, describe_failure(e))
             return
 
     logger.info(summarise_run(response["messages"]))
-    new_torrents = [
-        name for name in torrent_context.internal_torrents if name not in known_torrents
-    ]
-    last_message = await reply_in_chunks(
-        message, best_reply(response["messages"], new_torrents)
-    )
+    new_torrents = _new(torrent_context, known_torrents)
+    reply = best_reply(response["messages"], new_torrents)
+    note = unfulfilled_note(response["messages"], new_torrents)
+    if note:
+        logger.warning(f"Correcting an unfulfilled reply: {reply[:200]!r}")
+        reply = f"{reply}\n\n**{note}**"
+    last_message = await reply_in_chunks(message, reply)
 
     if new_torrents:
-        await wait_for_downloads(last_message, torrent_context, new_torrents)
+        try:
+            await wait_for_downloads(last_message, torrent_context, new_torrents)
+        except Exception as e:
+            # Raising here only reaches discord.py's logger, which leaves the
+            # last word in the chat being that the download had started.
+            logger.exception("Waiting for the downloads failed")
+            await reply_in_chunks(
+                last_message,
+                f"The downloads were added but I lost track of them, so Plex has "
+                f"not been told to scan. {describe_failure(e)}",
+            )
 
 
 if __name__ == "__main__":

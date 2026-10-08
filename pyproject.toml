@@ -36,6 +36,7 @@ seed-torrent = "bot.upload_cli:seed_torrent"
 transcode-album = "bot.transcode_cli:transcode_album"
 find-opportunities = "bot.opportunity_cli:find_opportunities"
 ask-sprintboy = "bot.agent_cli:ask"
+clear-test-playlists = "bot.plex_cli:clear_test_playlists"
 
 [build-system]
 requires = ["hatchling"]

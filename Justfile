@@ -11,16 +11,20 @@ run:
     uv run python -m bot.main
 
 dev:
-    docker compose up --build
+    GIT_SHA=$(git rev-parse --short HEAD) docker compose up --build
 
 dev-daemon:
-    docker compose up --build -d
+    GIT_SHA=$(git rev-parse --short HEAD) docker compose up --build -d
 
 dev-stop:
     docker compose down
 
 test:
     uv run pytest -s
+
+# What the Plex tests left behind. Add --yes to actually delete it.
+clean-test-playlists *ARGS:
+    uv run python -m bot.plex_cli {{ARGS}}
 
 # One-shot query through the agent, no discord round trip
 ask *QUERY:
@@ -35,8 +39,26 @@ ollama-models:
 ollama-logs:
     tailscale ssh root@shiitake "docker logs -f --tail 50 ollama"
 
+# Push the decision-model server's compose file to unraid and (re)start it
+ollaya-deploy:
+    tailscale ssh root@shiitake "mkdir -p /mnt/user/appdata/ollaya /mnt/mycelium/appdata/ollaya && chown 1000:1000 /mnt/mycelium/appdata/ollaya"
+    cat docker-compose.ollaya.yml | tailscale ssh root@shiitake "cat > /mnt/user/appdata/ollaya/docker-compose.yml"
+    tailscale ssh root@shiitake "cd /mnt/user/appdata/ollaya && docker compose pull && docker compose up -d"
+
+# Pull a decision model onto the server, e.g. `just ollaya-pull laya`
+ollaya-pull MODEL:
+    tailscale ssh root@shiitake "docker exec ollaya ollaya pull {{MODEL}}"
+
+# What the decision-model server has, and what is loaded
+ollaya-models:
+    tailscale ssh root@shiitake "docker exec ollaya ollaya list && docker exec ollaya ollaya ps"
+
+ollaya-logs:
+    tailscale ssh root@shiitake "docker logs -f --tail 50 ollaya"
+
+# The commit is baked in so /ping and the startup log can name what is running
 build:
-    docker build -t sprintboy:latest .
+    docker build --build-arg GIT_SHA=$(git rev-parse --short HEAD) -t sprintboy:latest .
 
 deploy: build
     echo "Building production image..."

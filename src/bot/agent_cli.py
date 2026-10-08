@@ -41,7 +41,6 @@ async def _ask(
 
     # Imported here so that --provider is applied before the model is built.
     from bot.main import SYSTEM_PROMPT, AGENT_TOOLS, build_llm
-    from bot.output import clean_reply, message_text
     from langchain.agents import create_agent
 
     agent = create_agent(build_llm(), tools=AGENT_TOOLS, context_schema=TorrentContext)
@@ -56,16 +55,34 @@ async def _ask(
             fg="cyan",
         )
     )
-    async for chunk in agent.astream(
-        {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ]
-        },
+    from bot.output import ADD_NUDGE, needs_add_nudge
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": query},
+    ]
+    messages = await _stream(agent, messages, context)
+    # Same single retry the Discord bot makes for a search that was never added.
+    if needs_add_nudge(messages, list(context.internal_torrents)):
+        click.echo(click.style("  (nudging: searched but never added)", fg="magenta"))
+        await _stream(
+            agent, [*messages, {"role": "user", "content": ADD_NUDGE}], context
+        )
+
+
+async def _stream(agent, messages, context) -> list:
+    """Run the agent, echoing tool calls and replies, and return the final messages."""
+    from bot.output import clean_reply, message_text
+
+    final = messages
+    async for mode, chunk in agent.astream(
+        {"messages": messages},
         context=context,
-        stream_mode="updates",
+        stream_mode=["updates", "values"],
     ):
+        if mode == "values":
+            final = chunk.get("messages", final)
+            continue
         for node, update in chunk.items():
             for message in (
                 update.get("messages", []) if isinstance(update, dict) else []
@@ -79,7 +96,7 @@ async def _ask(
                     click.echo(click.style(f"  ← {body[:400]}", fg="green"))
                 elif node == "model" and clean_reply(message.content):
                     click.echo(clean_reply(message.content))
-
+    return final
 
 if __name__ == "__main__":
     ask()

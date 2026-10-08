@@ -1,5 +1,8 @@
+import functools
 import logging
 import os
+import subprocess
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -68,6 +71,10 @@ class Config:
     # tools error out and check_for_album falls back to exact-name matching.
     LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
+    # The commit the bot is running. The Dockerfile bakes this in at build time
+    # because the deployed container holds no .git to ask.
+    GIT_SHA = os.getenv("GIT_SHA", "")
+
     @classmethod
     def validate(cls):
         assert cls.DISCORD_TOKEN, "DISCORD_TOKEN is not set"
@@ -102,3 +109,35 @@ class Config:
             assert cls.OLLAMA_MODEL, "OLLAMA_MODEL is not set"
         else:
             assert cls.ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY is not set"
+
+
+@functools.cache
+def git_sha() -> str:
+    """The commit this process is running, or "unknown".
+
+    GIT_SHA wins, since in the container it is the only truth available. Asking
+    git is the fallback for running out of a checkout, where the working tree
+    can also be ahead of the last commit -- hence the "-dirty" marker, without
+    which a local edit looks like whatever was committed before it.
+    """
+    if Config.GIT_SHA:
+        return Config.GIT_SHA
+    repo = Path(__file__).resolve().parent
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.strip()
+
+    try:
+        sha = git("rev-parse", "--short", "HEAD")
+        dirty = bool(git("status", "--porcelain"))
+    except (OSError, subprocess.SubprocessError):
+        # No git binary, or not a checkout: the container before GIT_SHA existed.
+        return "unknown"
+    return f"{sha}-dirty" if dirty else sha

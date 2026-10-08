@@ -126,6 +126,75 @@ def best_reply(messages, new_torrents: list[str] | None = None) -> str:
     )
 
 
+# Calling any of these means the model was working out what to download, so a
+# turn that made one and added nothing owes the person an answer. The library
+# checks count: the deployed bot replied 'Added "Alone in IZ World"' off the
+# back of check_for_album alone, without ever searching for a torrent.
+_MEDIA_TOOLS = (
+    "search_for_torrent",
+    "add_torrent",
+    "check_for_album",
+    "check_for_movie",
+)
+
+
+def tool_names(messages) -> list[str]:
+    """Every tool the model called this turn, in order."""
+    return [
+        call["name"]
+        for message in messages
+        for call in getattr(message, "tool_calls", None) or []
+    ]
+
+
+ADD_NUDGE = (
+    "You searched for torrents but never called add_torrent, so nothing is "
+    "downloading. If this was an open-ended request, call add_torrent now "
+    "with the torrents you chose (one call, all names), searching for replacement "
+    "albums first if your picks had no results. If it was a specific request and "
+    "nothing suitable was found, or everything is already owned, just say so."
+)
+
+
+def needs_add_nudge(messages, new_torrents: list[str] | None) -> bool:
+    """True when a turn searched for torrents and then stopped without adding any.
+
+    Small models routinely end with "Added: ..." straight after the search, so one
+    extra prompt is far cheaper than the person asking again.
+    """
+    if new_torrents:
+        return False
+    called = tool_names(messages)
+    return "search_for_torrent" in called and "add_torrent" not in called
+
+
+def unfulfilled_note(messages, new_torrents: list[str] | None) -> str:
+    """Contradict a reply that claims a download when nothing was added.
+
+    A self-hosted model will end its turn with "Added: <album>" having never
+    called add_torrent at all, and that text is what gets posted, so the only
+    way the person asking finds out is by opening qBittorrent themselves. There
+    is no reliable way to tell a real claim from an invented one in prose, so
+    whenever a shopping turn adds nothing we state the ground truth instead.
+    """
+    if new_torrents:
+        return ""
+    called = set(tool_names(messages))
+    if not called.intersection(_MEDIA_TOOLS):
+        return ""
+    if "add_torrent" in called:
+        return (
+            "Nothing reached qBittorrent this turn: every add failed. Ignore any "
+            "claim above that something is downloading, and ask me again."
+        )
+    # Worded to sit under an honest "you already own it" as well, since there is
+    # no telling the two apart from the prose.
+    return (
+        "Nothing was added to qBittorrent this turn. If anything above says "
+        "otherwise, ignore it and ask me again."
+    )
+
+
 def name_list(names) -> str:
     """Format names as a markdown list, one per line."""
     return "\n".join(f"- {name}" for name in names)
@@ -157,11 +226,7 @@ def summarise_run(messages) -> str:
     Logging the whole message list re-logged the system prompt and every tool
     result on each message, which is most of what the container's log holds.
     """
-    tools = [
-        call["name"]
-        for message in messages
-        for call in getattr(message, "tool_calls", None) or []
-    ]
+    tools = tool_names(messages)
     reply = best_reply(messages)
     if len(reply) > 200:
         reply = f"{reply[:200]}..."

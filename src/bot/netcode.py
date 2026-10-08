@@ -402,6 +402,43 @@ PLEX_LIBRARY_CATEGORIES: dict[str, BTCategory] = {
     "TV Shows": BTCategory.TV,
 }
 
+# Playlists the tests create start with this, so they can be found again and
+# deleted without having to recognise them by content.
+TEST_PLAYLIST_PREFIX = "sprintboy-test"
+# test_make_playlist used to name its playlist after the track it was built
+# from, leaving empty duplicates that look like anything else on the server.
+# Those are only ever swept when they hold no items, so a real playlist that
+# happens to share the name survives.
+LEGACY_TEST_PLAYLIST_TITLES = ("Rapp Snitch Knishes",)
+
+
+class PlaylistSummary(BaseModel):
+    """Just enough of a Plex playlist to list it and delete it."""
+
+    id: str
+    title: str
+    items: int = 0
+
+
+def _playlist_summary(raw: dict) -> PlaylistSummary | None:
+    """Read a playlist out of a Plex response, skipping anything unusable.
+
+    Plex gives the id twice: as `ratingKey` and inside `key`
+    ("/playlists/39244/items"), which is the form `get_playlist` returns.
+    """
+    playlist_id = str(raw.get("ratingKey") or "").strip()
+    if not playlist_id:
+        parts = str(raw.get("key", "")).split("/")
+        playlist_id = parts[2] if len(parts) > 2 else ""
+    title = str(raw.get("title", "")).strip()
+    if not playlist_id or not title:
+        return None
+    try:
+        items = int(raw.get("leafCount") or 0)
+    except (TypeError, ValueError):
+        items = 0
+    return PlaylistSummary(id=playlist_id, title=title, items=items)
+
 
 class PlexAPIClient(AsyncAPIClient):
     def __init__(self):
@@ -538,7 +575,39 @@ class PlexAPIClient(AsyncAPIClient):
         closest_playlist_idx = playlist_names.index(closest_playlist_name)
         return playlists[closest_playlist_idx]["key"].split("/")[2]
 
-    async def delete_playlist(self, playlist_id: int) -> None:
+    async def find_test_playlists(
+        self, prefix: str = TEST_PLAYLIST_PREFIX, include_legacy: bool = True
+    ) -> list[PlaylistSummary]:
+        """The playlists on the server that the test suite created."""
+        found: list[PlaylistSummary] = []
+        for raw in await self.get_playlists():
+            summary = _playlist_summary(raw)
+            if summary is None:
+                continue
+            if summary.title.casefold().startswith(prefix.casefold()):
+                found.append(summary)
+            elif (
+                include_legacy
+                and summary.items == 0
+                and summary.title in LEGACY_TEST_PLAYLIST_TITLES
+            ):
+                found.append(summary)
+        return found
+
+    async def delete_playlists(self, playlists: Sequence[PlaylistSummary]) -> int:
+        """Delete the given playlists, carrying on past ones already gone."""
+        deleted = 0
+        for playlist in playlists:
+            try:
+                await self.delete_playlist(playlist.id)
+            except Exception as e:
+                logging.warning(f"Could not delete playlist {playlist.title}: {e}")
+                continue
+            logging.info(f"Deleted playlist {playlist.title} ({playlist.id})")
+            deleted += 1
+        return deleted
+
+    async def delete_playlist(self, playlist_id: int | str) -> None:
         await self._request(
             "DELETE",
             f"/playlists/{playlist_id}",

@@ -16,7 +16,7 @@ from bot.netcode import (
     resolve_release,
 )
 from dataclasses import dataclass
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from thefuzz import fuzz, process
 
 # Whole-title similarity at or above this means the user already owns the album.
@@ -25,6 +25,8 @@ ALBUM_MATCH_THRESHOLD = 90
 # a reissue, or a different album that happens to share a prefix. The agent is
 # given these to judge rather than being told they are a collision.
 ALBUM_CONTAINED_THRESHOLD = 90
+# Displayed result lines per search query (all results are still stored).
+MAX_RESULTS_PER_QUERY = 25
 
 
 @dataclass
@@ -36,22 +38,39 @@ class TorrentContext:
     torrent_types: set[BTCategory]
 
 
+def _str_to_list(value):
+    """Small models often send a bare string where a list is expected."""
+    return [value] if isinstance(value, str) else value
+
+
 class TorrentAddQuery(BaseModel):
-    name: str
+    names: list[str]
     category: BTCategory
+
+    @field_validator("names", mode="before")
+    @classmethod
+    def _wrap_names(cls, value):
+        return _str_to_list(value)
 
 
 class TorrentSearchQuery(BaseModel):
-    query: str
+    queries: list[str]
     category: BTCategory
+
+    @field_validator("queries", mode="before")
+    @classmethod
+    def _wrap_queries(cls, value):
+        return _str_to_list(value)
 
 
 @tool(args_schema=TorrentSearchQuery)
 async def search_for_torrent(
-    query: str, category: BTCategory, runtime: ToolRuntime[TorrentContext]
+    queries: list[str], category: BTCategory, runtime: ToolRuntime[TorrentContext]
 ) -> str:
     """
-    Perform a search query on qBittorrent and return the results.
+    Perform one or more search queries on qBittorrent and return the results per query.
+    You can and should pass several queries at once (for example one per album, as
+    "Artist Album") instead of calling this tool repeatedly.
     This is not like google.
     It only returns results that match the query in a fuzzy REGEX.
     Do not include words like "discography" or "album" in your search, this tool only returns single album torrents, or single movies, or single episodes.
@@ -60,45 +79,143 @@ async def search_for_torrent(
     Do not include words like "BluRay" or "720p" or "1080p" in your query.
     """
     runtime.context.torrent_types.add(category)
-    async with QBittorrentClient() as qclient:
-        results = await qclient.search(query, category)
-        if not results.results:
-            return "No results found."
+    # qBittorrent rejects more than 5 concurrent search jobs.
+    semaphore = asyncio.Semaphore(3)
+
+    async def _search_one(query: str) -> list[SearchResult]:
+        async with semaphore:
+            async with QBittorrentClient() as qclient:
+                response = await qclient.search(query, category)
+        found = response.results or []
         # filter out results that are not flacs
         if category == BTCategory.Music:
-            results = [
-                result for result in results.results if ("FLAC" in result.fileName)
-            ]
-        else:
-            results = results.results
+            found = [result for result in found if "FLAC" in result.fileName]
+        return found
 
+    outcomes = await asyncio.gather(
+        *[_search_one(query) for query in queries], return_exceptions=True
+    )
+
+    sections = []
+    for query, outcome in zip(queries, outcomes):
+        if isinstance(outcome, BaseException):
+            logging.warning(f"Search for '{query}' failed: {outcome}")
+            sections.append(f"Search for '{query}' failed: {outcome}")
+            continue
+        if not outcome:
+            sections.append(f"No results for '{query}'.")
+            continue
         # Store results in runtime for later use
-        for result in results:
+        for result in outcome:
             runtime.context.search_results[result.fileName] = result
-        summary = "\n".join(result.fileName for result in results)
-    return f"Search results:\n{summary}"
+        lines = [result.fileName for result in outcome[:MAX_RESULTS_PER_QUERY]]
+        hidden = len(outcome) - len(lines)
+        if hidden > 0:
+            lines.append(f"({hidden} more not shown; search more specifically)")
+        sections.append(f"Results for '{query}':\n" + "\n".join(lines))
+    if runtime.context.search_results:
+        # Small models read a search result as the end of the job and reply
+        # "Added ..." without ever adding; saying so here is cheaper than a retry.
+        sections.append(
+            "Nothing is downloading yet. Call add_torrent once with every name you "
+            "picked, exactly as written above."
+        )
+    return "\n\n".join(sections)
+
+
+# How long to wait for a submitted torrent to appear in qBittorrent before
+# treating the add as failed. qBittorrent answers "Ok." as soon as it has taken
+# the URL and fetches it afterwards, so this is the earliest moment at which
+# "added" can be said truthfully.
+ADD_CONFIRM_TIMEOUT = 20.0
+
+
+async def _add_one(name: str, category: BTCategory, context: TorrentContext, corrected_name: str | None = None) -> str:
+    if corrected_name is None:
+        top_result = process.extractOne(name, context.search_results.keys())
+        corrected_name = top_result[0]
+        score = top_result[1]
+        if score < 80:
+            return (
+                f"NOT ADDED: '{name}' is not one of the search results. Add a name "
+                f"exactly as search_for_torrent returned it."
+            )
+
+    url = context.search_results[corrected_name].fileUrl
+
+    async with QBittorrentClient() as qclient:
+        memory_code = await qclient.add_torrent(url, category)
+        if memory_code is None:
+            return (
+                f"NOT ADDED: QBITTORRENT_DRY_RUN is on, so '{corrected_name}' was "
+                f"never submitted. Tell the user nothing was downloaded."
+            )
+        # An add whose URL qBittorrent cannot fetch -- an expired Jackett key, a
+        # dead indexer -- is reported exactly like a successful one, so confirm
+        # the torrent exists before calling it added.
+        try:
+            info = await qclient.get_torrent_info(
+                memory_code, timeout=ADD_CONFIRM_TIMEOUT
+            )
+        except TimeoutError as e:
+            logging.error(f"Add of '{corrected_name}' was accepted but never appeared: {e}")
+            return (
+                f"NOT ADDED: qBittorrent accepted '{corrected_name}' but the torrent "
+                f"never appeared, so nothing is downloading. Tell the user it failed. "
+                f"Details: {e}"
+            )
+        context.internal_torrents[corrected_name] = memory_code
+    return f"Added '{info.name}', confirmed present in qBittorrent."
 
 
 @tool(args_schema=TorrentAddQuery)
 async def add_torrent(
-    name: str, category: BTCategory, runtime: ToolRuntime[TorrentContext]
+    names: list[str], category: BTCategory, runtime: ToolRuntime[TorrentContext]
 ) -> str:
-    """Add a torrent to qBittorrent using a name retrieved from a previous search. Fuzzy search."""
-    runtime.context.torrent_types.add(category)
-    top_result = process.extractOne(name, runtime.context.search_results.keys())
-    corrected_name = top_result[0]
-    score = top_result[1]
-    if score < 80:
-        raise FileNotFoundError(
-            f"Torrent with name '{name}' not found in known torrents."
+    """Add torrents to qBittorrent using names retrieved from a previous search. Fuzzy search.
+
+    Pass every torrent you chose in one call.
+    Only tell the user you downloaded something if this tool answers "Added" for it.
+    Any line starting with "NOT ADDED" means that item is not downloading and you
+    must say that instead.
+    """
+    context = runtime.context
+    context.torrent_types.add(category)
+    if not context.search_results:
+        return (
+            "NOT ADDED: there are no search results to add from. Call "
+            "search_for_torrent first, then add one of the names it returned."
         )
 
-    url = runtime.context.search_results[corrected_name].fileUrl
+    # Resolve up front so two names resolving to the same torrent add it once.
+    jobs: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    lines: dict[int, str] = {}
+    for index, name in enumerate(names):
+        top_result = process.extractOne(name, context.search_results.keys())
+        if top_result is None or top_result[1] < 80:
+            lines[index] = (
+                f"NOT ADDED: '{name}' is not one of the search results. Add a name "
+                f"exactly as search_for_torrent returned it."
+            )
+            continue
+        corrected = top_result[0]
+        if corrected in seen:
+            lines[index] = f"NOT ADDED: '{name}' resolves to '{corrected}', already being added in this call."
+            continue
+        seen.add(corrected)
+        jobs.append((index, corrected))
 
-    async with QBittorrentClient() as qclient:
-        memory_code = await qclient.add_torrent(url, category)
-        runtime.context.internal_torrents[corrected_name] = memory_code
-        return "Torrent added successfully."
+    outcomes = await asyncio.gather(
+        *[_add_one(corrected, category, context, corrected) for _, corrected in jobs],
+        return_exceptions=True,
+    )
+    for (index, corrected), outcome in zip(jobs, outcomes):
+        if isinstance(outcome, BaseException):
+            logging.warning(f"Add of '{corrected}' failed: {outcome}")
+            outcome = f"NOT ADDED: adding '{corrected}' failed: {outcome}"
+        lines[index] = outcome
+    return "\n".join(lines[i] for i in range(len(names)))
 
 
 class PlexAlbumQuery(BaseModel):
@@ -148,15 +265,7 @@ def _album_scores(candidates: list[str], name: str) -> tuple[int, int]:
     return whole, contained
 
 
-@tool(args_schema=PlexAlbumQuery)
-async def check_for_album(artist: str, title: str | None = None) -> str:
-    """
-    Check whether the user already owns an album. Always call this before downloading music.
-    Artist and album names are canonicalised through Last.fm and then every album the user
-    has by that artist is compared fuzzily, so aliases, punctuation and deluxe editions are
-    all caught. You do not need to retry this tool with alternative spellings yourself.
-    Omit the title to list everything the user has by that artist.
-    """
+async def _check_album(artist: str, title: str | None) -> str:
     album_type = PLEX_CONTENT_TYPES["album"]
     release = await _canonicalise(artist, title)
     logging.debug(
@@ -178,15 +287,26 @@ async def check_for_album(artist: str, title: str | None = None) -> str:
     # Keyed by ratingKey so the same album found under two artist spellings is
     # only reported once.
     owned: dict[str, tuple[str, str]] = {}
+    failures: list[BaseException] = []
     for response in responses:
         if isinstance(response, BaseException):
             logging.warning(f"Plex album lookup failed: {response}")
+            failures.append(response)
             continue
         for item in _plex_metadata(response):
             album_title = str(item.get("title", ""))
             credited = str(item.get("parentTitle", ""))
             key = str(item.get("ratingKey") or f"{credited}:{album_title}")
             owned[key] = (album_title, credited)
+
+    if failures and len(failures) == len(responses):
+        # Plex answers an expired token with a 401, and reporting that as an
+        # empty library is how the same album gets downloaded twice.
+        return (
+            f"COULD NOT CHECK: every Plex lookup for {release.artist} failed "
+            f"({failures[0]}). Do not assume the user does or does not own this "
+            f"album; say the library check failed and carry on."
+        )
 
     note = ""
     if release.corrected:
@@ -240,6 +360,47 @@ async def check_for_album(artist: str, title: str | None = None) -> str:
         f"safe to download. They do already have these other albums by that artist:\n"
         f"{listing}"
     )
+
+
+@tool(args_schema=PlexAlbumQuery)
+async def check_for_album(artist: str, title: str | None = None) -> str:
+    """
+    Check whether the user already owns an album. Always call this before downloading music.
+    Artist and album names are canonicalised through Last.fm and then every album the user
+    has by that artist is compared fuzzily, so aliases, punctuation and deluxe editions are
+    all caught. You do not need to retry this tool with alternative spellings yourself.
+    Omit the title to list everything the user has by that artist.
+    """
+    return await _check_album(artist, title)
+
+
+class AlbumRef(BaseModel):
+    artist: str
+    title: str
+
+
+class PlexAlbumsQuery(BaseModel):
+    albums: list[AlbumRef]
+
+
+@tool(args_schema=PlexAlbumsQuery)
+async def check_albums(albums: list[AlbumRef]) -> str:
+    """
+    Check whether the user already owns several albums at once. Check every candidate
+    album in one call; prefer this over check_for_album when you have more than one album.
+    Names are canonicalised through Last.fm and compared fuzzily, like check_for_album.
+    """
+    refs = [AlbumRef.model_validate(a) if isinstance(a, dict) else a for a in albums]
+    results = await asyncio.gather(
+        *[_check_album(ref.artist, ref.title) for ref in refs],
+        return_exceptions=True,
+    )
+    sections = []
+    for ref, result in zip(refs, results):
+        if isinstance(result, BaseException):
+            result = f"COULD NOT CHECK: {result}"
+        sections.append(f"### {ref.artist} - {ref.title}\n{result}")
+    return "\n\n".join(sections)
 
 
 class PlexSongQuery(BaseModel):
@@ -324,18 +485,70 @@ class LastFMSimilarQuery(BaseModel):
 
 
 class LastFMAlbumsQuery(BaseModel):
-    artist: str
+    artists: list[str]
     limit: int = 15
+
+    @field_validator("artists", mode="before")
+    @classmethod
+    def _wrap_artists(cls, value):
+        return _str_to_list(value)
 
 
 class LastFMTagQuery(BaseModel):
     tag: str
-    limit: int = 15
+    limit: int = 30
 
 
 class LastFMResolveQuery(BaseModel):
     artist: str
     album: str | None = None
+
+
+async def _library_albums(plex, artist: str) -> list[str] | None:
+    """Album titles the user has by exactly this artist name, or None if Plex failed."""
+    try:
+        results = await plex.get_all_library_items(
+            {"type": PLEX_CONTENT_TYPES["album"], "artist.title": artist}
+        )
+        return [str(item.get("title", "")) for item in _plex_metadata(results)]
+    except Exception as e:
+        logging.warning(f"Plex library lookup for {artist} failed: {e}")
+        return None
+
+
+def _ownership(owned: list[str] | None, album: str) -> str:
+    if owned is None:
+        return " [library check failed]"
+    maybe = None
+    for title in owned:
+        whole, contained = _album_scores([album], title)
+        if whole >= ALBUM_MATCH_THRESHOLD:
+            return " [OWNED]"
+        if maybe is None and contained >= ALBUM_CONTAINED_THRESHOLD:
+            maybe = title
+    return f" [maybe owned as '{maybe}']" if maybe is not None else ""
+
+
+def _artist_ownership(owned: list[str] | None) -> str:
+    if owned is None:
+        return " [library check failed]"
+    return f" [in library: {len(owned)} albums]" if owned else " [new to you]"
+
+
+async def _library_lookup(artists: list[str]) -> dict[str, list[str] | None]:
+    """Owned album titles per distinct artist; all None if Plex is unreachable."""
+    distinct = list(dict.fromkeys(artists))
+    if not distinct:
+        return {}
+    try:
+        async with PlexAPIClient() as plex:
+            owned = await asyncio.gather(
+                *[_library_albums(plex, name) for name in distinct]
+            )
+        return dict(zip(distinct, owned))
+    except Exception as e:
+        logging.warning(f"Plex unavailable for library annotation: {e}")
+        return {name: None for name in distinct}
 
 
 @tool(args_schema=LastFMArtistQuery)
@@ -365,44 +578,74 @@ async def lastfm_similar_artists(artist: str, limit: int = 15) -> str:
     Find artists Last.fm considers similar to a given artist, most similar first, with a
     0-1 similarity score. Use this for "more like this" and "introduce me to new music"
     requests rather than guessing at similar artists yourself.
+    Artists are marked with library ownership ([in library: N albums] / [new to you]), so
+    you can skip ones the user already has without calling check_albums separately.
     """
     async with LastFMClient() as lastfm:
         similar = await lastfm.get_similar_artists(artist, limit=limit)
     if not similar:
         return f"Last.fm has no similar artists for {artist}."
+    owned = await _library_lookup([item.name for item in similar])
     listing = "\n".join(
-        f"- {item.name}" + (f" (similarity {item.match:.2f})" if item.match else "")
+        f"- {item.name}"
+        + (f" (similarity {item.match:.2f})" if item.match else "")
+        + _artist_ownership(owned.get(item.name))
         for item in similar
     )
     return f"Artists similar to {artist}:\n{listing}"
 
 
-@tool(args_schema=LastFMAlbumsQuery)
-async def lastfm_artist_albums(artist: str, limit: int = 15) -> str:
-    """
-    List an artist's albums from Last.fm, most listened first. These are real releases with
-    real spellings, so use this to build a discography before searching for torrents instead
-    of recalling album names from memory. Raise the limit for a fuller discography, but be
-    aware the tail of the list drifts into singles, live records and compilations.
-    """
+async def _artist_albums_section(artist: str, limit: int) -> str:
     async with LastFMClient() as lastfm:
         albums = await lastfm.get_artist_albums(artist, limit=limit)
     if not albums:
         return f"Last.fm has no albums listed for {artist}."
+    resolved = albums[0].artist or artist
+    owned = (await _library_lookup([resolved]))[resolved]
     listing = "\n".join(
         f"- {album.name}"
         + (f" ({album.playcount:,} plays)" if album.playcount else "")
+        + _ownership(owned, album.name)
         for album in albums
     )
-    return f"Albums by {albums[0].artist or artist} on Last.fm, most played first:\n{listing}"
+    new = sum(1 for album in albums if _ownership(owned, album.name) == "")
+    return (
+        f"Albums by {resolved} on Last.fm, most played first:\n{listing}\n"
+        f"{new} of these are not in the library."
+    )
+
+
+@tool(args_schema=LastFMAlbumsQuery)
+async def lastfm_artist_albums(artists: list[str], limit: int = 15) -> str:
+    """
+    List albums from Last.fm for one or more artists, most listened first. Pass every
+    artist you are considering in one call. These are real releases with real spellings,
+    so use this to build a discography before searching for torrents instead of recalling
+    album names from memory. Raise the limit for a fuller discography, but be aware the
+    tail of the list drifts into singles, live records and compilations.
+    Albums are marked [OWNED] / [maybe owned as ...] when the user's library has them, so
+    pick unmarked ones directly without calling check_albums separately.
+    """
+    results = await asyncio.gather(
+        *[_artist_albums_section(artist, limit) for artist in artists],
+        return_exceptions=True,
+    )
+    return "\n\n".join(
+        f"Last.fm lookup for {artist} failed: {result}"
+        if isinstance(result, BaseException)
+        else result
+        for artist, result in zip(artists, results)
+    )
 
 
 @tool(args_schema=LastFMTagQuery)
-async def lastfm_browse_tag(tag: str, limit: int = 15) -> str:
+async def lastfm_browse_tag(tag: str, limit: int = 30) -> str:
     """
     Browse a Last.fm genre or style tag (for example "future jazz", "shoegaze",
     "hauntology") and get back the top artists and top albums carrying that tag. Use this
     when the user asks for a style rather than a specific artist.
+    Results are marked with library ownership (albums [OWNED], artists [in library: N
+    albums] / [new to you]) so you can skip owned ones without calling check_albums separately.
     """
     async with LastFMClient() as lastfm:
         artists, albums = await asyncio.gather(
@@ -411,17 +654,30 @@ async def lastfm_browse_tag(tag: str, limit: int = 15) -> str:
         )
     if not artists and not albums:
         return f"Last.fm has nothing tagged '{tag}'. Try a broader or differently spelled tag."
+    owned = await _library_lookup(
+        [item.name for item in artists]
+        + [album.artist for album in albums if album.artist]
+    )
     sections = []
     if artists:
         sections.append(
             f"Top artists tagged '{tag}':\n"
-            + "\n".join(f"- {item.name}" for item in artists)
+            + "\n".join(
+                f"- {item.name}" + _artist_ownership(owned.get(item.name))
+                for item in artists
+            )
         )
     if albums:
         sections.append(
             f"Top albums tagged '{tag}':\n"
             + "\n".join(
-                f"- {album.name}" + (f" by {album.artist}" if album.artist else "")
+                f"- {album.name}"
+                + (f" by {album.artist}" if album.artist else "")
+                + (
+                    _ownership(owned.get(album.artist), album.name)
+                    if album.artist
+                    else ""
+                )
                 for album in albums
             )
         )

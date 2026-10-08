@@ -2,7 +2,12 @@ version: '3.8'
 
 services:
   sprintboy:
-    build: .
+    build:
+      context: .
+      args:
+        # `just dev` passes the checkout's commit; a bare `docker compose up`
+        # gets the placeholder, which is honest about not knowing.
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: sprintboy-dev
     restart: unless-stopped
     volumes:

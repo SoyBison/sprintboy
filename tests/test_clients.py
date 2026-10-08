@@ -12,8 +12,10 @@ import aiohttp
 import pytest
 
 from bot.netcode import (
+    TEST_PLAYLIST_PREFIX,
     AsyncAPIClient,
     BTCategory,
+    PlaylistSummary,
     PlexAPIClient,
     QBittorrentClient,
 )
@@ -193,6 +195,77 @@ class TestPlexRequest:
         client, _ = _plex_client(_FakeResponse(200, text="unexpected"))
         with pytest.raises(Exception, match="Failed to delete playlist: 200"):
             await client.delete_playlist(7)
+
+
+def _playlists_response(*playlists: dict) -> _FakeResponse:
+    return _FakeResponse(200, payload={"MediaContainer": {"Metadata": list(playlists)}})
+
+
+def _raw_playlist(title: str, playlist_id: str, items: int = 0) -> dict:
+    return {
+        "ratingKey": playlist_id,
+        "key": f"/playlists/{playlist_id}/items",
+        "title": title,
+        "leafCount": items,
+        "playlistType": "audio",
+    }
+
+
+class TestFindTestPlaylists:
+    """The sweep has to find every playlist the tests made and nothing else."""
+
+    @pytest.mark.asyncio
+    async def test_prefixed_playlists_are_found_whatever_their_size(self):
+        client, _ = _plex_client(
+            _playlists_response(
+                _raw_playlist(f"{TEST_PLAYLIST_PREFIX}-playlist", "1"),
+                _raw_playlist(f"{TEST_PLAYLIST_PREFIX}-playlist", "2", items=3),
+                _raw_playlist("Summervibes 2026 A", "3", items=10),
+            )
+        )
+        found = await client.find_test_playlists()
+        assert [p.id for p in found] == ["1", "2"]
+
+    @pytest.mark.asyncio
+    async def test_empty_legacy_playlists_are_swept_but_used_ones_are_not(self):
+        """The old test named its playlist after the track, so the name alone is
+        not proof: only the empty ones are safe to delete."""
+        client, _ = _plex_client(
+            _playlists_response(
+                _raw_playlist("Rapp Snitch Knishes", "1"),
+                _raw_playlist("Rapp Snitch Knishes", "2", items=12),
+            )
+        )
+        found = await client.find_test_playlists()
+        assert [p.id for p in found] == ["1"]
+
+        client, _ = _plex_client(_playlists_response(_raw_playlist("Rapp Snitch Knishes", "1")))
+        assert await client.find_test_playlists(include_legacy=False) == []
+
+    @pytest.mark.asyncio
+    async def test_id_falls_back_to_the_key_and_junk_is_skipped(self):
+        client, _ = _plex_client(
+            _playlists_response(
+                {"key": "/playlists/9/items", "title": f"{TEST_PLAYLIST_PREFIX}-a"},
+                {"title": f"{TEST_PLAYLIST_PREFIX}-no-id"},
+                {"ratingKey": "10"},
+            )
+        )
+        found = await client.find_test_playlists()
+        assert [(p.id, p.title) for p in found] == [("9", f"{TEST_PLAYLIST_PREFIX}-a")]
+
+    @pytest.mark.asyncio
+    async def test_delete_playlists_counts_successes_and_survives_failures(self):
+        client, session = _plex_client(_FakeResponse(204))
+        deleted = await client.delete_playlists(
+            [PlaylistSummary(id="1", title="a"), PlaylistSummary(id="2", title="b")]
+        )
+        assert deleted == 2
+        assert [call["url"].rsplit("/", 1)[-1] for call in session.calls] == ["1", "2"]
+
+        # A playlist deleted by hand in between must not abort the sweep.
+        client, session = _plex_client(_FakeResponse(404))
+        assert await client.delete_playlists([PlaylistSummary(id="1", title="a")]) == 0
 
 
 class TestPlexUnwrapping:
