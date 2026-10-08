@@ -17,6 +17,7 @@ from bot.questions import ROUTE_QUESTIONS, ROUTE_QUESTIONS_NAME
 # Below this the route is not trusted, and the agent gets every tool and
 # classifies the request itself as it did before.
 MIN_CONFIDENCE = 0.6
+MIN_DOMAIN_CONFIDENCE = 0.5
 
 DEFAULT_OPEN_ENDED_COUNT = 3
 MAX_COUNT = 20
@@ -56,7 +57,10 @@ class Route:
 
     @property
     def trusted(self) -> bool:
-        return self.domain_p >= MIN_CONFIDENCE and self.kind_p >= MIN_CONFIDENCE
+        # The domain gets a lower bar: a bare misspelled title ("get me in
+        # rainbowz") is plainly a download request but only ~0.6 music, and the
+        # workflows defer to the agent anyway when they find nothing.
+        return self.domain_p >= MIN_DOMAIN_CONFIDENCE and self.kind_p >= MIN_CONFIDENCE
 
     def note(self) -> str:
         """The instruction handed to the agent alongside the conversation."""

@@ -11,8 +11,11 @@ from bot.netcode import (
     TorrentInfoResponse,
 )
 
-from bot.tools import TorrentContext
-from bot import aotm, turn
+from bot.tools import AlbumRef, TorrentContext, download_many
+from bot import aotm, turn, workflows
+from bot.agent import AgentResult
+from bot.choices import DidYouMeanView
+from bot.workflows import Choice, Pending, describe_lines
 from bot.llm import OllamaChat
 from bot.runlog import record_run
 from bot.output import (
@@ -233,6 +236,187 @@ def _new(context: TorrentContext, known: set[str]) -> list[str]:
     return [name for name in context.internal_torrents if name not in known]
 
 
+async def wait_and_report(
+    last_message: discord.Message, torrent_context: TorrentContext, new_torrents: list[str]
+) -> None:
+    """Wait for new downloads, saying so in the chat if waiting itself fails."""
+    try:
+        await wait_for_downloads(last_message, torrent_context, new_torrents)
+    except Exception as e:
+        # Raising here only reaches discord.py's logger, which leaves the
+        # last word in the chat being that the download had started.
+        logger.exception("Waiting for the downloads failed")
+        await reply_in_chunks(
+            last_message,
+            f"The downloads were added but I lost track of them, so Plex has "
+            f"not been told to scan. {describe_failure(e)}",
+        )
+
+
+def write_run_log(**fields) -> None:
+    try:
+        record_run(**fields)
+    except Exception:
+        logger.exception("Writing the run log failed")
+
+
+async def ask_did_you_mean(
+    last_message: discord.Message,
+    pending: list[Pending],
+    author: discord.abc.User,
+    *,
+    history: list[dict[str, str]],
+    reply: str,
+    root_id: int,
+    torrent_context: TorrentContext,
+) -> None:
+    """One message with buttons per unresolved request, as replies to the bot's last message."""
+    media = workflows._media_from(turn.latest_user_text(history))
+    for item in pending:
+
+        async def on_pick(
+            interaction: discord.Interaction, choice: Choice | None, item: Pending = item
+        ) -> None:
+            try:
+                if choice is None:
+                    await hand_to_agent(
+                        interaction.message, author, item, history, reply, root_id, torrent_context
+                    )
+                else:
+                    await download_choice(
+                        interaction.message, author, item, choice, media, root_id, torrent_context
+                    )
+            except Exception as e:
+                logger.exception("Handling a did-you-mean answer failed")
+                await reply_in_chunks(interaction.message, describe_failure(e))
+
+        view = DidYouMeanView(item, author.id, on_pick)
+        view.message = await last_message.reply(
+            f'"{item.wanted}":', view=view, mention_author=False
+        )
+
+
+async def download_choice(
+    target: discord.Message,
+    author: discord.abc.User,
+    item: Pending,
+    choice: Choice,
+    media: str | None,
+    root_id: int,
+    torrent_context: TorrentContext,
+) -> None:
+    """The asker picked a release: add it, then wait for it like any other download."""
+    started = time.perf_counter()
+    known = set(torrent_context.internal_torrents)
+    ref = AlbumRef(artist=choice.artist, title=choice.title)
+    async with target.channel.typing():
+        lines = await download_many([ref], torrent_context, media)
+    new_torrents = _new(torrent_context, known)
+    reply = describe_lines(lines, [ref])
+    last_message = await reply_in_chunks(target, reply)
+    write_run_log(
+        run_id=None,
+        message_id=target.id,
+        conversation_id=root_id,
+        author=author,
+        text=f'{item.wanted} -> {choice.label}',
+        route=None,
+        result=AgentResult(messages=[], steps=[], stopped="choice"),
+        new_torrents=new_torrents,
+        reply=reply,
+        note="",
+        seconds=time.perf_counter() - started,
+    )
+    if new_torrents:
+        await wait_and_report(last_message, torrent_context, new_torrents)
+
+
+async def hand_to_agent(
+    target: discord.Message,
+    author: discord.abc.User,
+    item: Pending,
+    history: list[dict[str, str]],
+    reply: str,
+    root_id: int,
+    torrent_context: TorrentContext,
+) -> None:
+    """None of the options fit: let the agent, which can search more freely, try."""
+    follow_up = [
+        *history,
+        {"role": "assistant", "content": reply},
+        {
+            "role": "user",
+            "content": f'None of those. I meant "{item.wanted}" \u2014 find the right release.',
+        },
+    ]
+    await run_and_reply(
+        target, author, follow_up, root_id, torrent_context, use_workflows=False
+    )
+
+
+async def run_and_reply(
+    target: discord.Message,
+    author: discord.abc.User,
+    history: list[dict[str, str]],
+    root_id: int,
+    torrent_context: TorrentContext,
+    *,
+    use_workflows: bool = True,
+) -> None:
+    """Run one turn for `history`, reply to `target`, log it and wait for any downloads."""
+    known_torrents = set(torrent_context.internal_torrents)
+    started = time.perf_counter()
+
+    async with target.channel.typing():
+        try:
+            t = await turn.prepare(history)
+            logger.info(
+                f"Handling message {target.id} in conversation {root_id} run {t.run_id}"
+            )
+            result = await turn.run(t, torrent_context, use_workflows=use_workflows)
+        except Exception as e:
+            logger.exception("Agent invocation failed")
+            await reply_in_chunks(target, describe_failure(e))
+            return
+
+    logger.info(f"Run {t.run_id}: {summarise_run(result.messages)}")
+    new_torrents = _new(torrent_context, known_torrents)
+    reply = best_reply(result.messages, new_torrents)
+    note = unfulfilled_note(result.messages, new_torrents)
+    if note:
+        logger.warning(f"Correcting an unfulfilled reply: {reply[:200]!r}")
+        reply = f"{reply}\n\n**{note}**"
+    last_message = await reply_in_chunks(target, reply)
+
+    write_run_log(
+        run_id=t.run_id,
+        message_id=target.id,
+        conversation_id=root_id,
+        author=author,
+        text=turn.latest_user_text(history),
+        route=t.route,
+        result=result,
+        new_torrents=new_torrents,
+        reply=reply,
+        note=note,
+        seconds=time.perf_counter() - started,
+    )
+
+    if result.pending:
+        await ask_did_you_mean(
+            last_message,
+            result.pending,
+            author,
+            history=history,
+            reply=reply,
+            root_id=root_id,
+            torrent_context=torrent_context,
+        )
+
+    if new_torrents:
+        await wait_and_report(last_message, torrent_context, new_torrents)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -250,59 +434,7 @@ async def on_message(message: discord.Message):
 
     history, root_id = await build_conversation(message)
     torrent_context = get_conversation_context(root_id)
-    known_torrents = set(torrent_context.internal_torrents)
-    started = time.perf_counter()
-
-    async with message.channel.typing():
-        try:
-            t = await turn.prepare(history)
-            logger.info(
-                f"Handling message {message.id} in conversation {root_id} run {t.run_id}"
-            )
-            result = await turn.run(t, torrent_context)
-        except Exception as e:
-            logger.exception("Agent invocation failed")
-            await reply_in_chunks(message, describe_failure(e))
-            return
-
-    logger.info(f"Run {t.run_id}: {summarise_run(result.messages)}")
-    new_torrents = _new(torrent_context, known_torrents)
-    reply = best_reply(result.messages, new_torrents)
-    note = unfulfilled_note(result.messages, new_torrents)
-    if note:
-        logger.warning(f"Correcting an unfulfilled reply: {reply[:200]!r}")
-        reply = f"{reply}\n\n**{note}**"
-    last_message = await reply_in_chunks(message, reply)
-
-    try:
-        record_run(
-            run_id=t.run_id,
-            message_id=message.id,
-            conversation_id=root_id,
-            author=message.author,
-            text=turn.latest_user_text(history),
-            route=t.route,
-            result=result,
-            new_torrents=new_torrents,
-            reply=reply,
-            note=note,
-            seconds=time.perf_counter() - started,
-        )
-    except Exception:
-        logger.exception("Writing the run log failed")
-
-    if new_torrents:
-        try:
-            await wait_for_downloads(last_message, torrent_context, new_torrents)
-        except Exception as e:
-            # Raising here only reaches discord.py's logger, which leaves the
-            # last word in the chat being that the download had started.
-            logger.exception("Waiting for the downloads failed")
-            await reply_in_chunks(
-                last_message,
-                f"The downloads were added but I lost track of them, so Plex has "
-                f"not been told to scan. {describe_failure(e)}",
-            )
+    await run_and_reply(message, message.author, history, root_id, torrent_context)
 
 
 if __name__ == "__main__":

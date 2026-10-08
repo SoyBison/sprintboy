@@ -14,7 +14,7 @@ import logging
 import re
 import string
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import zip_longest
 
 from thefuzz import fuzz
@@ -27,9 +27,13 @@ from bot.questions import (
     DISCOGRAPHY_QUESTIONS_NAME,
     RECOMMEND_FIT_NAME,
     RECOMMEND_SEED_NAME,
+    SPECIFIC_EXTRACT_NAME,
+    SPECIFIC_PICK_NAME,
     discography_questions,
     recommend_fit_questions,
     recommend_seed_questions,
+    specific_extract_questions,
+    specific_pick_questions,
 )
 from bot.releases import Release, _norm, best_versions, parse_release, quality_key
 from bot.routing import route_state
@@ -43,6 +47,7 @@ from bot.tools import (
     _maybe_title,
     _ownership,
     _same_release,
+    _title_matches,
     download_many,
 )
 
@@ -70,7 +75,9 @@ _SCOPE_NOUNS = {"albums": "albums", "everything": "releases", "newest": "newest 
 _SCOPE_SINGULAR = {"albums": "album", "everything": "release", "newest": "newest release"}
 
 
-def candidate_spans(text: str, max_words: int = 6) -> list[str]:
+def candidate_spans(
+    text: str, max_words: int = 6, stopwords: set[str] = STOPWORDS
+) -> list[str]:
     """Word n-grams of the message that could be an artist name."""
     words = []
     for raw in text.split():
@@ -81,7 +88,7 @@ def candidate_spans(text: str, max_words: int = 6) -> list[str]:
     for start in range(len(words)):
         for end in range(start + 1, min(start + max_words, len(words)) + 1):
             chunk = words[start:end]
-            if chunk[0].casefold() in STOPWORDS or chunk[-1].casefold() in STOPWORDS:
+            if chunk[0].casefold() in stopwords or chunk[-1].casefold() in stopwords:
                 continue
             span = " ".join(chunk)
             spans.setdefault(span.casefold(), span)
@@ -89,15 +96,32 @@ def candidate_spans(text: str, max_words: int = 6) -> list[str]:
 
 
 @dataclass
+class Choice:
+    label: str  # "Weather Report - Night Passage"
+    artist: str
+    title: str
+
+
+@dataclass
+class Pending:
+    """An unresolved "did you mean": what they asked for and the likeliest releases."""
+
+    wanted: str  # as they wrote it
+    options: list[Choice]  # 2-3, best first
+
+
+@dataclass
 class WorkflowResult:
     reply: str
     steps: list[Step]
+    pending: list[Pending] = field(default_factory=list)
 
     def to_agent_result(self, messages: list[Message]) -> AgentResult:
         return AgentResult(
             messages=[*messages, assistant(self.reply)],
             steps=self.steps,
             stopped="workflow",
+            pending=self.pending,
         )
 
 
@@ -374,11 +398,11 @@ def _looks_like_album(name: str) -> bool:
     return not (any(word in lowered for word in _NOT_AN_ALBUM) or lowered.endswith(" ep"))
 
 
-def _name_spans(text: str) -> list[str]:
+def _name_spans(text: str, stopwords: set[str] = STOPWORDS) -> list[str]:
     """Spans of the text that could be an artist, album or tag name."""
     return [
         span
-        for span in candidate_spans(text, max_words=MAX_SEED_WORDS)
+        for span in candidate_spans(text, max_words=MAX_SEED_WORDS, stopwords=stopwords)
         if not REQUEST_WORDS & {w.casefold() for w in span.split()}
     ]
 
@@ -689,3 +713,500 @@ async def recommend(
             why.append("couldn't add " + ", ".join(other_failed[:3]))
         parts.append(f"Only found {len(added)} of {count}: " + "; ".join(why or ["ran out of candidates"]) + ".")
     return WorkflowResult(reply="\n".join(parts), steps=steps)
+
+
+# ---------------------------------------------------------------------------
+# Specific releases: "get me Mordechai by Khruangbin", "download Loveless and Souvlaki".
+# ---------------------------------------------------------------------------
+
+MAX_SPECIFIC_SPANS = 120
+MAX_SPECIFIC_ALBUMS = 5
+MAX_PICK_CANDIDATES = 12
+MIN_ALBUM_SPAN = 0.5
+MIN_NAMED = 0.5
+# A longer span (with an edition word, say) beats a shorter one inside it unless
+# the shorter is clearly the better answer.
+LONGER_SPAN_MARGIN = 0.1
+SURE_PICK = 0.75
+UNSURE_PICK_TOTAL = 0.5
+MIN_OPTION_P = 0.1
+MAX_OPTIONS_OFFERED = 3
+MIN_OFFER_SIMILARITY = 45
+TRACK_ALBUMS = 3
+
+
+@dataclass
+class _Release:
+    artist: str
+    title: str
+    year: int | None = None
+    # Evidence for the picker, e.g. "has the track 'Fast City'" or the artist's
+    # Last.fm listeners: with no artist named, "in rainbowz" means Radiohead, not
+    # a 2k-listener act whose title happens to be spelled that way.
+    note: str = ""
+    listeners: int | None = None
+    track: str | None = None  # a song they named that is on this release
+
+    @property
+    def label(self) -> str:
+        return f"{self.artist} - {self.title}" + (f" ({self.year})" if self.year else "")
+
+    @property
+    def choice(self) -> Choice:
+        return Choice(label=f"{self.artist} - {self.title}", artist=self.artist, title=self.title)
+
+
+@dataclass
+class _Wanted:
+    span: str  # what they asked for, as written
+    artist: str | None
+    releases: list[_Release]
+    track: str | None = None
+    by_title: bool = True  # False when found through a song: titles say nothing about the span
+    written: str = ""  # the span with neighbouring title words, see _as_written
+
+
+def _pick_view(r: "_Release") -> dict:
+    view: dict = {"artist": r.artist, "title": r.title}
+    if r.year:
+        view["year"] = r.year
+    if r.listeners:
+        view["artist_listeners"] = r.listeners
+    if r.track:
+        view["has_track"] = r.track
+    return view
+
+
+def _compact(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _similarity(span: str, title: str) -> int:
+    a, b = span.casefold(), title.casefold()
+    return (fuzz.ratio(a, b) + fuzz.token_set_ratio(a, b)) // 2
+
+
+def _add_release(found: dict[tuple[str, str], _Release], artist: str | None, title: str, year: int | None = None) -> None:
+    if not artist or not _norm(title):
+        return
+    key = (artist.casefold(), _norm(title))
+    existing = found.get(key)
+    if existing is None:
+        found[key] = _Release(artist, title, year)
+    elif existing.year is None and year:
+        existing.year = year
+
+
+# Titles often begin with these ("In Rainbows", "The Bends"); for artist and tag
+# names they are noise, but here a span starting with one must stay possible.
+TITLE_STARTERS = {"in", "the", "a", "an"}
+
+
+def _title_spans(text: str) -> list[str]:
+    return [*_name_spans(text), *_name_spans(text, STOPWORDS - TITLE_STARTERS)]
+
+
+def _specific_spans(text: str, state: dict) -> list[str]:
+    """Spans of the message, then of the last two turns it may refer to."""
+    spans = _title_spans(text)
+    for entry in state.get("earlier", [])[-2:]:
+        spans.extend(_title_spans(entry["text"]))
+    unique: dict[str, str] = {}
+    for span in spans:
+        unique.setdefault(span.casefold(), span)
+    return list(unique.values())[:MAX_SPECIFIC_SPANS]
+
+
+# A longer span this plausible is kept as what they wrote, for the picker.
+MIN_WRITTEN_SPAN = 0.2
+
+
+def _select_albums(spans: list[str], decision) -> list[tuple[str, float]]:
+    """Spans judged to be albums, one per mention, as (span, probability) in message order."""
+    scored = [(i, span, decision.noul(f"album_{i}")) for i, span in enumerate(spans)]
+    chosen = [(i, span, p) for i, span, p in scored if p >= MIN_ALBUM_SPAN]
+    dropped: set[int] = set()
+    for i, short, p_short in chosen:
+        for j, long, p_long in chosen:
+            if len(long) > len(short) and short.casefold() in long.casefold():
+                dropped.add(i if p_long >= p_short - LONGER_SPAN_MARGIN else j)
+    kept = [(i, span, p) for i, span, p in chosen if i not in dropped]
+    kept = sorted(kept, key=lambda item: -item[2])[:MAX_SPECIFIC_ALBUMS]
+    return [(span, p) for _, span, p in sorted(kept)]
+
+
+def _as_written(span: str, spans: list[str], decision) -> str:
+    """The span with the words around it that might belong to the title.
+
+    For "get me in rainbowz" the extract call prefers "rainbowz", but handed
+    "rainbowz" the picker matches the title literally and chooses an act
+    called RaINBOWZ; "in rainbowz" points it at Radiohead. The longest span
+    containing this one that is still plausibly a title is what they wrote.
+    """
+    best = span
+    for i, other in enumerate(spans):
+        if (
+            len(other) > len(best)
+            and span.casefold() in other.casefold()
+            and decision.noul(f"album_{i}") >= MIN_WRITTEN_SPAN
+        ):
+            best = other
+    return best
+
+
+async def _safe(semaphore: asyncio.Semaphore, coro, default, what: str):
+    async with semaphore:
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning(f"{what} failed: {e}")
+            return default
+
+
+async def _album_releases(
+    span: str,
+    artist: str | None,
+    context: TorrentContext,
+    lastfm: LastFMClient,
+    semaphore: asyncio.Semaphore,
+) -> list[_Release]:
+    """Releases that the words of a request could mean, from Last.fm and the tracker."""
+    canonical = artist
+    if artist:
+        correction = await _safe(semaphore, lastfm.correct_artist(artist), None, "Last.fm correction")
+        canonical = correction.name if correction else artist
+
+    async def artist_side() -> list[_Release]:
+        if not canonical:
+            return []
+        found: dict[tuple[str, str], _Release] = {}
+        info, albums = await asyncio.gather(
+            _safe(semaphore, lastfm.get_album_info(canonical, span), None, "Last.fm album info"),
+            _safe(semaphore, lastfm.get_artist_albums(canonical, limit=50), [], "Last.fm artist albums"),
+        )
+        if info is not None:
+            _add_release(found, info.artist or canonical, info.name)
+        fuzzy = [
+            (max(fuzz.token_set_ratio(span, a.name), fuzz.partial_ratio(span.casefold(), a.name.casefold())), a)
+            for a in albums
+            if fuzz.token_set_ratio(span, a.name) >= 70
+            or fuzz.partial_ratio(span.casefold(), a.name.casefold()) >= 80
+        ]
+        for _, a in sorted(fuzzy, key=lambda item: -item[0])[:5]:
+            _add_release(found, a.artist or canonical, a.name)
+        return list(found.values())
+
+    async def search_side() -> list[_Release]:
+        found: dict[tuple[str, str], _Release] = {}
+        albums = await _safe(semaphore, lastfm.search_albums(span, limit=8), [], "Last.fm album search")
+        albums = [a for a in albums if a.artist]
+        if canonical:
+            names = {canonical.casefold(), (artist or canonical).casefold()}
+            matching = [
+                a for a in albums
+                if any(fuzz.partial_ratio(n, a.artist.casefold()) >= 80 for n in names)
+            ]
+            # The artist may be what they misremembered, so keep two others.
+            albums = matching + [a for a in albums if a not in matching][:2]
+        for a in albums:
+            _add_release(found, a.artist, a.name)
+        return list(found.values())
+
+    async def tracker_side() -> list[_Release]:
+        query = f"{canonical} {span}" if canonical else span
+
+        async def search():
+            async with QBittorrentClient() as qclient:
+                return await qclient.search(query, BTCategory.Music)
+
+        response = await _safe(semaphore, search(), None, "Tracker search")
+        if response is None:
+            return []
+        flac = [r for r in (response.results or []) if "FLAC" in r.fileName]
+        for r in flac:
+            context.search_results[r.fileName] = r
+        parsed = best_versions([r.fileName for r in flac])
+        parsed.sort(key=lambda r: -_similarity(span, r.title))
+        found: dict[tuple[str, str], _Release] = {}
+        for r in parsed[:5]:
+            _add_release(found, r.artist, r.title, r.year)
+        return list(found.values())
+
+    sides = await asyncio.gather(artist_side(), search_side(), tracker_side())
+    found: dict[tuple[str, str], _Release] = {}
+    for side in sides:
+        for r in side:
+            _add_release(found, r.artist, r.title, r.year)
+    # Most like the request first, so the cap drops the least likely.
+    ranked = sorted(found.values(), key=lambda r: -_similarity(span, r.title))
+    return ranked[:MAX_PICK_CANDIDATES]
+
+
+async def _track_releases(
+    track: str, artist: str | None, lastfm: LastFMClient, semaphore: asyncio.Semaphore
+) -> list[_Release]:
+    """The albums that songs matching `track` appear on."""
+    songs = await _safe(semaphore, lastfm.search_tracks(track, artist, limit=5), [], "Last.fm track search")
+    albums = await asyncio.gather(
+        *[
+            _safe(semaphore, lastfm.get_track_album(a, t), None, "Last.fm track info")
+            for a, t in songs[:TRACK_ALBUMS]
+        ]
+    )
+    found: dict[tuple[str, str], _Release] = {}
+    for (song_artist, _), album in zip(songs, albums):
+        if album is not None:
+            _add_release(found, album.artist or song_artist, album.name)
+    releases = list(found.values())
+    for release in releases:
+        release.note = f"has a track called '{track}'"
+        release.track = track
+    return releases
+
+
+def _top_options(probabilities: dict, keys: list[str]) -> list[tuple[str, float]]:
+    scored = []
+    for key in keys:
+        try:
+            scored.append((key, float(probabilities.get(key, 0.0))))
+        except (TypeError, ValueError):
+            scored.append((key, 0.0))
+    return sorted(scored, key=lambda item: -item[1])
+
+
+def _by_similarity(want: _Wanted, likelihood: dict[int, float] | None = None) -> list[_Release]:
+    """Candidates closest to the request in spelling, the model's pick breaking ties."""
+    if not want.by_title:
+        return list(want.releases)
+    likelihood = likelihood or {}
+    index = {id(r): i for i, r in enumerate(want.releases)}
+    ranked = sorted(
+        want.releases,
+        key=lambda r: (-_similarity(want.span, r.title), -likelihood.get(index[id(r)], 0.0)),
+    )
+    return [r for r in ranked if _similarity(want.span, r.title) >= MIN_OFFER_SIMILARITY]
+
+
+def _offer(want: _Wanted, options: list[_Release]) -> Pending | None:
+    """A did-you-mean, never with fewer than two options."""
+    if len(options) >= 2:
+        return Pending(want.span, [r.choice for r in options[:MAX_OPTIONS_OFFERED]])
+    return None
+
+
+async def _pick(
+    want: _Wanted, text: str, earlier: list[dict] | None, run_id: str | None
+) -> tuple[_Release | Pending | None, str]:
+    """Settle one wanted release: resolved, pending or None (not found), plus a log line."""
+    if not want.releases:
+        return None, "no candidates"
+    keys = [f"r{i}" for i in range(len(want.releases))]
+    state = route_state(text, earlier) | {
+        "wanted": {
+            "title": want.written or want.span,
+            "artist": want.artist,
+            "track": want.track,
+        },
+        # Structured, not "Artist - Title [notes]": Jev weighs a listeners
+        # number it can see far more than one buried in a label (0.82 vs 0.14
+        # for In Rainbows over a 14-listener "Rainbowz").
+        "candidates": {k: _pick_view(r) for k, r in zip(keys, want.releases)},
+    }
+    decision = await decide(SPECIFIC_PICK_NAME, state, specific_pick_questions(keys), run_id=run_id)
+    if decision is None:
+        matching = [r for r in want.releases if _title_matches(want.span, r.title)]
+        if len(matching) == 1 and want.by_title:
+            return matching[0], "no decision; the one title that matches"
+        return _offer(want, _by_similarity(want)), "no decision; fuzzy"
+
+    pick, p = decision.choice("pick")
+    ranked = _top_options(decision.answers["pick"].get("probabilities", {}), keys)
+    shown = ", ".join(f"{want.releases[keys.index(k)].label}={q:.2f}" for k, q in ranked[:3])
+    log = f"pick={pick} ({p:.2f}); {shown}"
+    if pick != "none" and pick in keys and p >= SURE_PICK:
+        return want.releases[keys.index(pick)], log
+    top = ranked[:MAX_OPTIONS_OFFERED]
+    if sum(q for _, q in top) >= UNSURE_PICK_TOTAL:
+        plausible = [(k, q) for k, q in top if q >= MIN_OPTION_P]
+        if len(plausible) >= 2:
+            return Pending(want.span, [want.releases[keys.index(k)].choice for k, _ in plausible]), log
+        if plausible and plausible[0][1] >= MIN_NAMED:
+            return want.releases[keys.index(plausible[0][0])], log
+        return None, log
+    likelihood = {keys.index(k): q for k, q in ranked}
+    return _offer(want, _by_similarity(want, likelihood)), log
+
+
+def _label_of(line: str, ref: AlbumRef | None) -> str:
+    if ref is not None:
+        return f"{ref.artist} - {ref.title}"
+    match = re.search(r"'(.*?)'(?=[\s.,]|$)", line)
+    name = match.group(1) if match else line
+    release = parse_release(name)
+    return f"{release.artist} - {release.title}" if release else name.split(" [")[0]
+
+
+def describe_lines(lines: list[str], refs: list[AlbumRef] | None = None) -> str:
+    """Plain wording for download_many's result lines; `refs` are the albums, in order."""
+    added: list[str] = []
+    other: list[str] = []
+    for i, line in enumerate(lines):
+        ref = refs[i] if refs is not None and i < len(refs) else None
+        if line.startswith("Added"):
+            added.append(_label_of(line, ref))
+            continue
+        label = _label_of(line, ref)
+        if line.startswith("OWNED"):
+            other.append(f"You already have {label}.")
+        elif line.startswith("NOT FOUND"):
+            other.append(f"Couldn't find a FLAC of {label} on the tracker.")
+        elif line.startswith("NOT ADDED"):
+            other.append(f"Couldn't add {label}: {_reason(line)}")
+        else:
+            other.append(line)
+    parts = []
+    if len(added) == 1:
+        parts.append(f"Added {added[0]}.")
+    elif added:
+        parts.append("Added:\n" + "\n".join(f"- {a}" for a in added))
+    return "\n".join([*parts, *other])
+
+
+async def specific(
+    text: str,
+    context: TorrentContext,
+    *,
+    earlier: list[dict] | None = None,
+    run_id: str | None = None,
+) -> WorkflowResult | None:
+    """Add the particular releases a message names, or ask "did you mean", or None to defer."""
+    steps: list[Step] = []
+
+    def record(stage: str, started: float, args: dict, result: str) -> None:
+        steps.append(
+            Step(
+                kind="tool",
+                name=f"specific/{stage}",
+                seconds=time.perf_counter() - started,
+                args=args,
+                result=result,
+            )
+        )
+
+    # a. What is wanted, from which artist.
+    started = time.perf_counter()
+    state = route_state(text, earlier)
+    spans = _specific_spans(text, state)
+    if not spans:
+        return None
+    decision = await decide(
+        SPECIFIC_EXTRACT_NAME,
+        state | {"spans": {f"album_{i}": span for i, span in enumerate(spans)}},
+        specific_extract_questions(spans),
+        run_id=run_id,
+    )
+    if decision is None:
+        return None
+
+    # b. Albums, artist and song.
+    albums = _select_albums(spans, decision)
+    artist_choice, artist_p = decision.choice("artist")
+    track_choice, track_p = decision.choice("track")
+    artist = artist_choice if artist_choice != "none" and artist_p >= MIN_NAMED else None
+    track = track_choice if track_choice != "none" and track_p >= MIN_NAMED else None
+    record(
+        "extract", started, {"spans": len(spans)},
+        f"albums={[(s, round(p, 2)) for s, p in albums]} artist={artist!r} ({artist_p:.2f}) "
+        f"track={track!r} ({track_p:.2f})",
+    )
+    # The artist's own name is not an album; a self-titled album asked for
+    # alone is the one case this loses, and the agent still gets it.
+    if artist and (track or len(albums) > 1):
+        albums = [(s, p) for s, p in albums if s.casefold() != artist.casefold()]
+    if not albums and not track:
+        return None
+
+    # c. Candidates for each wanted release.
+    started = time.perf_counter()
+    semaphore = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+    wanted: list[_Wanted] = []
+    async with LastFMClient() as lastfm:
+        if albums:
+            # The same words named as artist and as album: one of them is wrong, so
+            # search the album without trusting the artist.
+            credited = [
+                None if artist and span.casefold() == artist.casefold() else artist
+                for span, _ in albums
+            ]
+            found = await asyncio.gather(
+                *[
+                    _album_releases(span, by, context, lastfm, semaphore)
+                    for (span, _), by in zip(albums, credited)
+                ]
+            )
+            wanted = [
+                _Wanted(span, by, releases, written=_as_written(span, spans, decision))
+                for (span, _), by, releases in zip(albums, credited, found)
+            ]
+        else:
+            releases = await _track_releases(track, artist, lastfm, semaphore)
+            wanted = [_Wanted(f"the album with {track}", artist, releases, track, by_title=False)]
+    record(
+        "candidates", started, {"wanted": [w.span for w in wanted]},
+        " | ".join(f"{w.span}: " + "; ".join(r.label for r in w.releases) for w in wanted),
+    )
+
+    # Popularity, so a misspelling resolves to the release people mean.
+    artists = list(dict.fromkeys(r.artist for w in wanted for r in w.releases))
+    if artists:
+        started = time.perf_counter()
+        async with LastFMClient() as lastfm:
+            infos = await asyncio.gather(
+                *[_safe(semaphore, lastfm.get_artist_info(a), None, "Last.fm artist info") for a in artists]
+            )
+        listeners = {a: i.listeners for a, i in zip(artists, infos) if i and i.listeners}
+        for w in wanted:
+            for r in w.releases:
+                if r.artist in listeners:
+                    r.listeners = listeners[r.artist]
+                    popularity = f"artist has {_compact(listeners[r.artist])} Last.fm listeners"
+                    r.note = f"{r.note}; {popularity}" if r.note else popularity
+        record("popularity", started, {"artists": artists}, str(listeners))
+
+    # d. Settle each one.
+    started = time.perf_counter()
+    outcomes = await asyncio.gather(*[_pick(w, text, earlier, run_id) for w in wanted])
+    record(
+        "pick", started, {"wanted": [w.span for w in wanted]},
+        " | ".join(f"{w.span}: {log}" for w, (_, log) in zip(wanted, outcomes)),
+    )
+    resolved: list[_Release] = []
+    pending: list[Pending] = []
+    missing: list[str] = []
+    for w, (outcome, _) in zip(wanted, outcomes):
+        if isinstance(outcome, _Release):
+            resolved.append(outcome)
+        elif isinstance(outcome, Pending):
+            pending.append(outcome)
+        else:
+            missing.append(w.span)
+    if not resolved and not pending:
+        return None
+
+    # e. Download what is settled.
+    parts: list[str] = []
+    if resolved:
+        started = time.perf_counter()
+        refs = [AlbumRef(artist=r.artist, title=r.title) for r in resolved]
+        lines = await download_many(refs, context, media=_media_from(text))
+        record("download", started, {"albums": [r.label for r in resolved]}, " | ".join(lines))
+        parts.append(describe_lines(lines, refs))
+
+    # f. Reply.
+    parts.extend(f'Couldn\'t find anything called "{span}".' for span in missing)
+    parts.extend(f'Did you mean one of these for "{p.wanted}"?' for p in pending)
+    return WorkflowResult(reply="\n".join(parts), steps=steps, pending=pending)

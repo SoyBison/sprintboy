@@ -43,6 +43,8 @@ class AgentResult:
     steps: list[Step] = field(default_factory=list)
     stopped: str = "reply"
     nudged: bool = False
+    # Unresolved "did you mean" questions (workflows.Pending) for the chat to ask.
+    pending: list = field(default_factory=list)
 
 
 def _clip(text: str, limit: int) -> str:

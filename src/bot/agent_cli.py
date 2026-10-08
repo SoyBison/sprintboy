@@ -85,6 +85,9 @@ async def _ask(
                 click.echo(reply)
 
     result = await turn.run(t, context, on_event=echo)
+    for pending in result.pending:
+        options = "  ".join(f"{i}) {o.label}" for i, o in enumerate(pending.options, 1))
+        click.echo(click.style(f'  did you mean "{pending.wanted}": {options}', fg="magenta"))
     if result.nudged:
         click.echo(click.style("  (nudged: download turn added nothing)", fg="magenta"))
     try:

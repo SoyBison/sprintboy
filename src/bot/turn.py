@@ -202,15 +202,26 @@ async def prepare(history: list[dict]) -> Turn:
     )
 
 
-async def run(turn: Turn, context, on_event: Callable | None = None) -> AgentResult:
+async def run(
+    turn: Turn, context, on_event: Callable | None = None, use_workflows: bool = True
+) -> AgentResult:
     """Run the agent, with one follow-up if a download turn added nothing.
 
     Requests with a known shape go to a workflow first; it returns None when it
-    cannot handle the message, and the agent takes over.
+    cannot handle the message, and the agent takes over. `use_workflows=False`
+    goes straight to the agent.
     """
     decided = turn.route
-    if decided and decided.trusted and decided.domain == "music":
-        if decided.kind == "discography":
+    if use_workflows and decided and decided.trusted and decided.domain == "music":
+        if decided.kind == "specific":
+            name = "specific"
+
+            def start():
+                return workflows.specific(
+                    turn.text, context, earlier=turn.earlier, run_id=turn.run_id
+                )
+
+        elif decided.kind == "discography":
             name = "discography"
 
             def start():

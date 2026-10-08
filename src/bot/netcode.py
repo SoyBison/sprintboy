@@ -943,12 +943,53 @@ class LastFMClient(AsyncAPIClient):
             tags.append((name, reach))
         return sorted(tags, key=lambda t: -t[1])
 
+    async def search_albums(self, album: str, limit: int = 8) -> list[LastFMAlbum]:
+        """Last.fm's album matches for a name, best first."""
+        body = await self._get("album.search", album=album, limit=limit)
+        results = _lastfm_dict(body.get("results"))
+        return _parse_lastfm_albums(_lastfm_dict(results.get("albummatches")))
+
     async def search_album(self, album: str) -> LastFMAlbum | None:
         """The best Last.fm match for an album name, or None."""
-        body = await self._get("album.search", album=album, limit=1)
-        results = _lastfm_dict(body.get("results"))
-        found = _parse_lastfm_albums(_lastfm_dict(results.get("albummatches")))
+        found = await self.search_albums(album, limit=1)
         return found[0] if found else None
+
+    async def search_tracks(
+        self, track: str, artist: str | None = None, limit: int = 5
+    ) -> list[tuple[str, str]]:
+        """Last.fm's track matches as (artist, track name), best first."""
+        body = await self._get("track.search", track=track, artist=artist, limit=limit)
+        results = _lastfm_dict(body.get("results"))
+        matches = _lastfm_dict(results.get("trackmatches"))
+        found = []
+        for raw in _lastfm_list(matches.get("track")):
+            name = _lastfm_str(raw.get("name"))
+            credit = raw.get("artist")
+            artist_name = (
+                _lastfm_str(credit.get("name")) if isinstance(credit, dict) else _lastfm_str(credit)
+            )
+            if name and artist_name:
+                found.append((artist_name, name))
+        return found
+
+    async def get_track_album(self, artist: str, track: str) -> LastFMAlbum | None:
+        """The album Last.fm files a track under, or None."""
+        body = await self._get("track.getInfo", artist=artist, track=track, autocorrect=1)
+        raw = _lastfm_dict(body.get("track"))
+        album = _lastfm_dict(raw.get("album"))
+        title = _lastfm_str(album.get("title")) or _lastfm_str(album.get("name"))
+        if not title:
+            return None
+        credit = album.get("artist")
+        artist_name = (
+            _lastfm_str(credit.get("name")) if isinstance(credit, dict) else _lastfm_str(credit)
+        )
+        return LastFMAlbum(
+            name=title,
+            artist=artist_name,
+            mbid=_lastfm_str(album.get("mbid")),
+            url=_lastfm_str(album.get("url")),
+        )
 
 
 async def resolve_release(artist: str, album: str | None = None) -> CanonicalRelease:

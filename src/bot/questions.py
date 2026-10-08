@@ -144,3 +144,63 @@ def recommend_fit_questions(keys: list[str]) -> dict:
         }
         for key in keys
     }
+
+SPECIFIC_EXTRACT_NAME = "specific_extract/v1"
+
+
+def specific_extract_questions(spans: list[str]) -> dict:
+    """Which spans are the artist, a song title and the albums asked for.
+
+    State: the route state plus {"spans": {"album_<i>": span}}, so each noul
+    question can point at its span.
+    """
+    questions: dict = {
+        "artist": {
+            "type": "choice",
+            "instructions": (
+                "Which of these is the artist whose release `message` asks for? "
+                "Use `earlier` only to resolve references like 'it' or 'that one'."
+            ),
+            "criteria": {span: None for span in spans}
+            | {"none": "none of these is an artist name"},
+        },
+        "track": {
+            "type": "choice",
+            "instructions": (
+                "Which of these is a song title that `message` names to identify an "
+                "album (e.g. 'the album with the track X'), if any?"
+            ),
+            "criteria": {span: None for span in spans}
+            | {"none": "the message names no song"},
+        },
+    }
+    for i in range(len(spans)):
+        questions[f"album_{i}"] = {
+            "type": "noul",
+            "instructions": (
+                f"Is `spans.album_{i}` the title of an album (or other release) that "
+                f"`message` asks to download? Not the artist's name, not a song."
+            ),
+        }
+    return questions
+
+
+SPECIFIC_PICK_NAME = "specific_pick/v3"
+
+
+def specific_pick_questions(keys: list[str]) -> dict:
+    """Which candidate release is the one asked for."""
+    return {
+        "pick": {
+            "type": "choice",
+            "instructions": (
+                "Which of `candidates` is the release `message` asks for? Allow for "
+                "misspellings and misremembered titles. A candidate whose `has_track` "
+                "is the song they named is very likely it, and when no artist is named "
+                "they most likely mean the well-known release (see `artist_listeners`). "
+                "'none' if none of them is it."
+            ),
+            "criteria": {key: None for key in keys}
+            | {"none": "none of the candidates is the release asked for"},
+        },
+    }
