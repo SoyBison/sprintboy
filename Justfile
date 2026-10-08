@@ -30,6 +30,10 @@ clean-test-playlists *ARGS:
 ask *QUERY:
     uv run python -m bot.agent_cli {{QUERY}}
 
+# What Orpheus' Album of the Month is right now, and the torrent the bot would offer
+aotm:
+    uv run python -m bot.aotm
+
 # Which models the configured ollama server has, and what is loaded
 ollama-models:
     curl -s $OLLAMA_API_URL/api/tags | python -m json.tool

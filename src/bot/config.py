@@ -43,6 +43,18 @@ class Config:
         for channel_id in os.getenv("DISCORD_CHANNEL_IDS", "").split(",")
         if channel_id.strip()
     ]
+    # API key for Orpheus (OPS), the private tracker whose Album of the Month
+    # the bot offers.
+    ORPHEUS_API_KEY = os.getenv("ORPHEUS_API_KEY", "")
+    ORPHEUS_URL = os.getenv("ORPHEUS_URL", "https://orpheus.network")
+    # Who gets the Album of the Month DM. Empty means the bot application's owner.
+    DISCORD_OWNER_ID = os.getenv("DISCORD_OWNER_ID", "")
+    # How often to look for a new Album of the Month winner.
+    AOTM_CHECK_HOURS = float(os.getenv("AOTM_CHECK_HOURS", "6"))
+    # Where the bot remembers which winners it has already asked about.
+    AOTM_STATE_PATH = os.getenv("AOTM_STATE_PATH", "data/aotm.json")
+    # How long a winner stays freeleech after being announced.
+    AOTM_FREELEECH_DAYS = 14
     # Add more config as needed
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

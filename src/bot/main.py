@@ -11,7 +11,7 @@ from bot.netcode import (
 )
 
 from bot.tools import TorrentContext
-from bot import turn
+from bot import aotm, turn
 from bot.turn import SYSTEM_PROMPT, AGENT_TOOLS, build_llm  # noqa: F401
 from bot.output import (
     best_reply,
@@ -151,6 +151,27 @@ async def wait_for_downloads(
     )
 
 
+async def _aotm_added(message: discord.Message, name: str, memory_code: str):
+    """Wait for an Album of the Month grab to finish, then have Plex scan it."""
+    context = TorrentContext(
+        search_results={},
+        internal_torrents={name: memory_code},
+        torrent_types={BTCategory.Music},
+    )
+    try:
+        await wait_for_downloads(message, context, [name])
+    except Exception as e:
+        logger.exception("Waiting for the AoTM download failed")
+        await reply_in_chunks(
+            message,
+            f"The download was added but I lost track of it, so Plex has "
+            f"not been told to scan. {describe_failure(e)}",
+        )
+
+
+aotm_loop = aotm.setup(bot, _aotm_added)
+
+
 @bot.event
 async def on_ready():
     logger.info(
@@ -166,6 +187,9 @@ async def on_ready():
         logger.info(f"{len(num_commands)} Slash commands synced in server guild")
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
+
+    if not aotm_loop.is_running():
+        aotm_loop.start()
 
 
 @bot.tree.command(name="ping", description="Check if the bot is responsive")
