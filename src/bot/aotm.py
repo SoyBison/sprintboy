@@ -126,6 +126,42 @@ class AotmButton(
             await _on_added(message, info.name, memory_code)
 
 
+async def lastfm_url(pick, torrent) -> str:
+    """The album's public Last.fm page, for the embed title to link to.
+
+    Orpheus pages only open in a logged-in browser, which the one Discord opens
+    never is. Last.fm is asked rather than a URL guessed so autocorrected
+    names land on the real page: first the announced title, then the
+    tracker's group name (AoTM winners are often a live or deluxe edition),
+    then the artist's page.
+    """
+    from bot.netcode import LastFMClient, LastFMError
+
+    try:
+        async with LastFMClient() as lastfm:
+            for artist, album in (
+                (pick.artist, pick.album),
+                (torrent.artist, torrent.group_name),
+            ):
+                try:
+                    info = await lastfm.get_album_info(artist, album)
+                except LastFMError:
+                    continue
+                if info.url:
+                    return info.url
+            try:
+                artist_info = await lastfm.get_artist_info(pick.artist)
+                if artist_info.url:
+                    return artist_info.url
+            except LastFMError:
+                pass
+    except Exception as e:  # Last.fm down or no key: a guessed link beats none
+        logger.warning(f"Last.fm lookup for the AoTM link failed: {e}")
+    return (
+        f"https://www.last.fm/music/{quote_plus(pick.artist)}/{quote_plus(pick.album)}"
+    )
+
+
 def _human_size(n: int) -> str:
     size = float(n)
     for unit in ("B", "KB", "MB", "GB"):
@@ -186,12 +222,7 @@ async def check_and_ask(bot, owner) -> str:
     if torrent.cover.startswith(("http://", "https://")):
         embed = discord.Embed(
             title=f"{torrent.artist} - {torrent.group_name}",
-            # A public page: Orpheus links only work in a logged-in browser,
-            # which the one Discord opens never is.
-            url=(
-                "https://www.last.fm/music/"
-                f"{quote_plus(pick.artist)}/{quote_plus(pick.album)}"
-            ),
+            url=await lastfm_url(pick, torrent),
         )
         embed.set_image(url=torrent.cover)
     message = await owner.send(content, embed=embed, view=view)

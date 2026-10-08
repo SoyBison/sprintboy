@@ -52,3 +52,13 @@ async def test_custom_id_round_trip():
     rebuilt = await aotm.AotmButton.from_custom_id(None, button.item, match)
     assert (rebuilt.action, rebuilt.torrent_id, rebuilt.key) == ("grab", 1663183, "219")
     assert rebuilt.item.custom_id == cid
+
+
+@pytest.fixture(autouse=True)
+def _no_lastfm(monkeypatch):
+    """The embed link lookup is the one network call check_and_ask makes itself."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        "bot.aotm.lastfm_url", AsyncMock(return_value="https://www.last.fm/music/X/Y")
+    )
